@@ -9,16 +9,19 @@ import zmq.asyncio
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.cache_controller.commands import FullSyncCommand, HeartbeatCommand
 from lmcache.v1.cache_controller.message import (
     DeRegisterMsg,
     HealthMsg,
     HealthRetMsg,
     HeartbeatMsg,
+    HeartbeatRetMsg,
     QueryInstMsg,
     QueryInstRetMsg,
     QueryWorkerInfoMsg,
     QueryWorkerInfoRetMsg,
     RegisterMsg,
+    RegisterRetMsg,
 )
 from lmcache.v1.cache_controller.observability import PrometheusLogger
 from lmcache.v1.cache_controller.utils import RegistryTree
@@ -41,7 +44,7 @@ class RegistrationController:
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
         if prometheus_logger is not None:
             prometheus_logger.registered_workers_count.set_function(
-                lambda: len(self.registry.get_all_worker_infos())
+                lambda: len(self.registry.get_all_worker_infos_cached())
             )
 
     def post_init(self, kv_controller, cluster_executor):
@@ -96,9 +99,19 @@ class RegistrationController:
             return QueryInstRetMsg(instance_id=None, event_id=event_id)
         return QueryInstRetMsg(instance_id=instance_node.instance_id, event_id=event_id)
 
-    async def register(self, msg: RegisterMsg) -> None:
+    async def register(
+        self, msg: RegisterMsg, extra_config: Optional[dict[str, str]] = None
+    ) -> RegisterRetMsg:
         """
         Register a new instance-worker connection mapping.
+
+        Args:
+            msg: RegisterMsg from worker
+            extra_config: Optional extra configuration to return to worker,
+                          e.g., {"heartbeat_url": "tcp://...:8082"}
+
+        Returns:
+            RegisterRetMsg with extra_config for worker initialization
         """
         instance_id = msg.instance_id
         worker_id = msg.worker_id
@@ -113,7 +126,12 @@ class RegistrationController:
                 "Instance-worker %s already registered, skip registration",
                 (instance_id, worker_id),
             )
-            return
+            self.registry.clear_worker_kv(instance_id, worker_id)
+            return (
+                RegisterRetMsg()
+                if extra_config is None
+                else RegisterRetMsg(extra_config=extra_config)
+            )
 
         peer_init_url = msg.peer_init_url
         if peer_init_url is None:
@@ -145,6 +163,11 @@ class RegistrationController:
         logger.info(
             "Registered instance-worker %s with URL %s", (instance_id, worker_id), url
         )
+        return (
+            RegisterRetMsg()
+            if extra_config is None
+            else RegisterRetMsg(extra_config=extra_config)
+        )
 
     async def deregister(self, msg: DeRegisterMsg) -> None:
         """
@@ -175,21 +198,49 @@ class RegistrationController:
             msg,
         )
 
-    # TODO: add more worker info in heartbeat
-    async def heartbeat(self, msg: HeartbeatMsg) -> None:
+    async def heartbeat(self, msg: HeartbeatMsg) -> HeartbeatRetMsg:
         """
-        Heartbeat from lmcache worker.
+        Heartbeat from lmcache worker (REQ-REP mode).
+
+        Returns HeartbeatRetMsg with optional commands for the worker to execute.
+        Commands are executed sequentially by the worker.
         """
         instance_id = msg.instance_id
         worker_id = msg.worker_id
         success = self.registry.update_heartbeat(instance_id, worker_id, time.time())
+
+        commands: list[HeartbeatCommand] = []
+
         if not success:
             logger.warning(
                 "%s has not been registered, re-register the worker.",
                 (instance_id, worker_id),
             )
             # re-register the worker
-            await self.register(msg)
+            register_msg = RegisterMsg(
+                instance_id=msg.instance_id,
+                worker_id=msg.worker_id,
+                ip=msg.ip,
+                port=msg.port,
+                peer_init_url=msg.peer_init_url,
+            )
+            await self.register(register_msg)
+            # New worker needs full sync
+            commands.append(FullSyncCommand(reason="worker_re_registered"))
+        else:
+            # Check if full sync is needed (e.g., controller restart)
+            if self.kv_controller is not None and hasattr(
+                self.kv_controller, "full_sync_tracker"
+            ):
+                should_sync, reason = (
+                    self.kv_controller.full_sync_tracker.should_request_full_sync(
+                        instance_id, worker_id
+                    )
+                )
+                if should_sync:
+                    commands.append(FullSyncCommand(reason=reason))
+
+        return HeartbeatRetMsg(commands=commands)
 
     async def query_worker_info(self, msg: QueryWorkerInfoMsg) -> QueryWorkerInfoRetMsg:
         """
@@ -201,7 +252,7 @@ class RegistrationController:
         # Handle special case: instance_id = "all"
         if msg.instance_id == "all":
             # Get all worker infos from the registry
-            worker_infos = self.registry.get_all_worker_infos()
+            worker_infos = self.registry.get_all_worker_infos_cached()
             # If specific worker_ids are requested, filter the results
             if msg.worker_ids is not None and len(msg.worker_ids) > 0:
                 worker_infos = [

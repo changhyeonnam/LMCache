@@ -7,11 +7,9 @@ from vllm.model_executor.layers.rotary_embedding import get_rope as vllm_get_rop
 import torch
 
 # First Party
+from lmcache import torch_device_type
 from lmcache.logging import init_logger
-
-if torch.cuda.is_available():
-    # First Party
-    import lmcache.c_ops as lmc_ops
+import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
 
@@ -113,9 +111,13 @@ def validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size) -> b
     hidden_dim = head_size * 8
     num_tokens = 10
 
-    dumb_q = torch.rand((num_tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
-    dumb_k = torch.rand((num_tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
-    positions = torch.arange(num_tokens, device="cuda")
+    dumb_q = torch.rand(
+        (num_tokens, hidden_dim), device=torch_device_type, dtype=torch.bfloat16
+    )
+    dumb_k = torch.rand(
+        (num_tokens, hidden_dim), device=torch_device_type, dtype=torch.bfloat16
+    )
+    positions = torch.arange(num_tokens, device=torch_device_type)
 
     q1 = dumb_q.clone()
     k1 = dumb_k.clone()
@@ -130,7 +132,7 @@ def validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size) -> b
 
     q_no_pos = dumb_q.clone()
     k_no_pos = dumb_k.clone()
-    positions2 = torch.arange(100, 100 + num_tokens, device="cuda")
+    positions2 = torch.arange(100, 100 + num_tokens, device=torch_device_type)
     _, k_pos2 = rope(positions2, q_no_pos, k_no_pos)
 
     k_no_pos = dumb_k.clone()
@@ -171,15 +173,22 @@ def get_fused_rope(
         )
         return None
 
+    new_rope_params = {
+        "rope_theta": base,
+        "partial_rotary_factor": partial_rotary_factor,
+    }
+    if rope_scaling is not None:
+        new_rope_params.update(rope_scaling)
+        if "type" in rope_scaling:
+            new_rope_params["rope_type"] = rope_scaling["type"]
+
     rope = vllm_get_rope(
-        head_size,
-        rotary_dim,
-        max_position,
-        base,
-        is_neox_style,
-        rope_scaling,
-        dtype,
-        partial_rotary_factor,
+        head_size=head_size,
+        max_position=max_position,
+        is_neox_style=is_neox_style,
+        rope_parameters=new_rope_params,
+        dtype=dtype,
+        dual_chunk_attention_config=None,
     )
 
     reverse_rope = BasicReverseRope(rope, rotary_dim, is_neox_style)

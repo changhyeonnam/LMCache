@@ -1,16 +1,21 @@
 workload:
   type: long_doc_qa
-  max-inflight-requests: 2
+  max-inflight-requests: 1
   repeat-count: 1
-  expected-latency: true
   completion: true
   num-documents: 20
+  document-length: 16382
 
 feature:
   type: pd
 
 docker-prefiller:
   env:
+    # Force vLLM Model Runner V1: MRV2 (enabled by default for Llama/Mistral
+    # dense models in vLLM nightly, see vllm-project/vllm#43458) is incompatible
+    # with KV cache connectors and hangs the PD path. Remove once MRV2 supports
+    # connectors / auto-falls back to MRV1.
+    - "VLLM_USE_V2_MODEL_RUNNER=0"
     - "LMCACHE_LOCAL_CPU=False"
     - "LMCACHE_MAX_LOCAL_CPU_SIZE=5"
     - "LMCACHE_ENABLE_PD=True"
@@ -19,11 +24,19 @@ docker-prefiller:
     - "LMCACHE_PD_PROXY_HOST=localhost"
     - "LMCACHE_PD_BUFFER_SIZE=1073741824" # 1GB
     - "LMCACHE_PD_BUFFER_DEVICE=cuda"
+    - "LMCACHE_SAVE_UNFULL_CHUNK=True"
     - "PYTHONHASHSEED=0"
+    - "LMCACHE_INTERNAL_API_SERVER_ENABLED=True"
+    - "LMCACHE_INTERNAL_API_SERVER_SOCKET_PATH_PREFIX=/tmp/lmcache_internal_api_server/socket"
   proxy-port: 7500
 
 docker-decoder:
   env:
+    # Force vLLM Model Runner V1: MRV2 (enabled by default for Llama/Mistral
+    # dense models in vLLM nightly, see vllm-project/vllm#43458) is incompatible
+    # with KV cache connectors and hangs the PD path. Remove once MRV2 supports
+    # connectors / auto-falls back to MRV1.
+    - "VLLM_USE_V2_MODEL_RUNNER=0"
     - "LMCACHE_LOCAL_CPU=False"
     - "LMCACHE_MAX_LOCAL_CPU_SIZE=0"
     - "LMCACHE_ENABLE_PD=True"
@@ -32,7 +45,10 @@ docker-decoder:
     - "LMCACHE_PD_PEER_HOST=localhost"
     - "LMCACHE_PD_BUFFER_SIZE=2147483648" # 2GB
     - "LMCACHE_PD_BUFFER_DEVICE=cuda"
+    - "LMCACHE_SAVE_UNFULL_CHUNK=True"
     - "PYTHONHASHSEED=0"
+    - "LMCACHE_INTERNAL_API_SERVER_ENABLED=True"
+    - "LMCACHE_INTERNAL_API_SERVER_SOCKET_PATH_PREFIX=/tmp/lmcache_internal_api_server/socket"
   init-port: 7300
   alloc-port: 7400
 
@@ -53,3 +69,6 @@ vllm-decoder:
     - "--no-enable-prefix-caching"
     - "--kv-transfer-config"
     - "{\"kv_connector\":\"LMCacheConnectorV1\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\": {\"discard_partial_chunks\": false, \"lmcache_rpc_port\": \"consumer1\", \"skip_last_n_tokens\": 1}}"
+
+checking-fields:
+  - query_round_time_per_prompt

@@ -153,6 +153,9 @@ class RequestExecutor:
         tokens_out = tok.usage.completion_tokens
         tokens_prefill = tok.usage.prompt_tokens
 
+        if first_token_time is None:
+            first_token_time = time.time()
+
         return Response(
             body=words,
             ttft=first_token_time - start_time,
@@ -552,7 +555,6 @@ class UserSessionManager:
         pending_queries = len([s for s in self.sessions if s.has_unfinished_request])
         assert self.start_time is not None
         start_time = max(self.start_time, start_time)
-        end_time = min(end_time, df["finish_time"].max())
         qps = self.workload_config.qps
 
         df = UserSessionManager.ProcessSummary(

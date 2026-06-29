@@ -13,6 +13,7 @@ from typing import (
     Sequence,
     Tuple,
     Union,
+    cast,
 )
 import asyncio
 import functools
@@ -22,7 +23,7 @@ import threading
 import torch
 
 # First Party
-from lmcache.config import LMCacheEngineMetadata
+from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.observability import PrometheusLogger
 from lmcache.utils import (
@@ -36,6 +37,7 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
 )
+from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend import CreateStorageBackends, is_cuda_worker
 from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
@@ -54,7 +56,7 @@ logger = init_logger(__name__)
 
 
 # Helper function to get the class name of the backend
-def get_backend_cname(backend: StorageBackendInterface):
+def get_backend_cname(backend: StorageBackendInterface) -> str:
     return backend.__class__.__name__
 
 
@@ -63,7 +65,7 @@ def allocate_and_copy_objects(
     allocator_backend: AllocatorBackendInterface,
     keys: Sequence[CacheEngineKey],
     src_memory_objs: list[MemoryObj],
-    stream: torch.cuda.Stream,
+    stream: Any,
 ) -> tuple[Sequence[CacheEngineKey], list[MemoryObj]]:
     """
     Allocate the memory objects and copy the data from src_memory_objs to
@@ -74,7 +76,8 @@ def allocate_and_copy_objects(
           objects
         keys: the cache engine keys corresponding to the memory objects
         src_memory_objs: the memory objects to copy from
-        stream: the cuda stream to run the copy in
+        stream: the device-specific GPU stream to run the copy in
+            (e.g., torch_dev.Stream on CUDA or XPU)
 
     Returns:
         - list of cache engine keys that corresponds to the memory objects
@@ -93,14 +96,25 @@ def allocate_and_copy_objects(
             busy_loop=False,
         )
 
-        if memory_obj is None or memory_obj.tensor is None:
+        if memory_obj is None:
             break
 
-        with torch.cuda.stream(stream):
+        if memory_obj.tensor is None:
+            # This should not happen with current implementation,
+            # but handle it defensively to avoid memory leak
+            logger.warning(
+                "Allocated MemoryObj has None tensor, this is unexpected. "
+                "Releasing the memory object."
+            )
+            memory_obj.ref_count_down()
+            break
+
+        with torch_dev.stream(stream):
             memory_obj.tensor.copy_(src_memory_obj.tensor, non_blocking=True)
         allocated_objects.append(memory_obj)
 
-    stream.synchronize()
+    if stream is not None:
+        stream.synchronize()
     return keys[: len(allocated_objects)], allocated_objects
 
 
@@ -209,9 +223,10 @@ class StorageManager:
     def __init__(
         self,
         config: LMCacheEngineConfig,
-        metadata: LMCacheEngineMetadata,
+        metadata: LMCacheMetadata,
         event_manager: EventManager,
         lmcache_worker: Optional["LMCacheWorker"] = None,
+        async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None,
     ):
         self.config = config
         self.metadata = metadata
@@ -220,24 +235,17 @@ class StorageManager:
         self.thread = threading.Thread(
             target=start_loop_in_thread_with_exceptions,
             args=(self.loop,),
-            name="storage-manger-event-loop",
+            name="storage-manager-event-loop",
         )
         self.thread.start()
 
-        # For scheduler role, always use CPU device
-        if is_cuda_worker(metadata):
-            dst_device = "cuda"
-        else:
-            dst_device = "cpu"
-        self.storage_backends: OrderedDict[str, StorageBackendInterface] = (
-            CreateStorageBackends(
-                config,
-                metadata,
-                self.loop,
-                dst_device,
-                lmcache_worker,
-            )
-        )
+        self.storage_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()
+        self.manager_lock = threading.Lock()
+        self.lmcache_worker = lmcache_worker
+
+        # Use the unified create path so that init and
+        # dynamic creation share the same logic.
+        self.create_backends()
 
         # the backend used for actual storage
         self.non_allocator_backends = self.get_non_allocator_backends()
@@ -247,23 +255,22 @@ class StorageManager:
         self.allocator_backend = None
         if metadata.role != "scheduler":
             self.allocator_backend = self._get_allocator_backend(config)
-        if config.local_cpu:
-            self.local_cpu_backend = self.storage_backends["LocalCPUBackend"]
 
-        self.manager_lock = threading.Lock()
+        self.local_cpu_backend = self.storage_backends.get("LocalCPUBackend", None)
 
-        self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
         self.worker_id = metadata.worker_id
 
         self.event_manager = event_manager
 
-        self.async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None
+        self.async_lookup_server: Optional["LMCacheAsyncLookupServer"] = (
+            async_lookup_server
+        )
         self.async_serializer: Optional[AsyncSerializer] = None
 
-        # The cuda stream for internal copies during put
+        # The GPU stream for internal copies during put
         if is_cuda_worker(metadata):
-            self.internal_copy_stream = torch.cuda.Stream()
+            self.internal_copy_stream = torch_dev.Stream()
         else:
             self.internal_copy_stream = None
 
@@ -271,16 +278,21 @@ class StorageManager:
         self._freeze = False
         self._freeze_lock = threading.RLock()
 
+        # Backend bypass mode: skip specific backends during health check failures
+        self._bypassed_backends: set[str] = set()
+        self._bypass_lock = threading.RLock()
+
+        if not self.enable_pd and self.config.enable_async_loading:
+            assert self.allocator_backend is not None
+            self.async_serializer = AsyncSingleSerializer(self.loop)
+
         self._setup_metrics()
 
-    def _setup_metrics(self):
-        prometheus_logger = PrometheusLogger.GetInstanceOrNone()
-        if prometheus_logger is None:
-            logger.warning(
-                "PrometheusLogger is not initialized, "
-                "event metrics will not be collected"
-            )
-            return
+    def _setup_metrics(self) -> None:
+        prometheus_logger = PrometheusLogger.GetOrCreate(
+            self.metadata,
+            config=self.config,
+        )
 
         metric_map = {
             "storage_events_ongoing_count": EventStatus.ONGOING,
@@ -296,19 +308,16 @@ class StorageManager:
                 )
             )
 
-    def post_init(self, **kwargs) -> None:
-        if "async_lookup_server" in kwargs:
-            self.async_lookup_server = kwargs.pop("async_lookup_server")
-        # PDBackend has't supported calculate_chunk_budget
-        if not self.enable_pd and self.config.enable_async_loading:
-            assert self.allocator_backend is not None
-            self.async_serializer = AsyncSingleSerializer(self.loop)
-
     def _get_allocator_backend(
         self, config: LMCacheEngineConfig
     ) -> AllocatorBackendInterface:
         if self.enable_pd:
             allocator_backend = self.storage_backends["PDBackend"]
+        elif "MaruBackend" in self.storage_backends:
+            if "LocalCPUBackend" in self.storage_backends:
+                allocator_backend = self.storage_backends["LocalCPUBackend"]
+            else:
+                allocator_backend = self.storage_backends["MaruBackend"]
         else:
             allocator_backend = self.storage_backends["LocalCPUBackend"]
         assert isinstance(allocator_backend, AllocatorBackendInterface)
@@ -400,6 +409,10 @@ class StorageManager:
         for backend_name, backend in self.storage_backends.items():
             if location and backend_name != location:
                 continue
+            # Skip bypassed backends
+            with self._bypass_lock:
+                if backend_name in self._bypassed_backends:
+                    continue
 
             allocator_backend = backend.get_allocator_backend()
             cname = get_backend_cname(allocator_backend)
@@ -434,7 +447,7 @@ class StorageManager:
             memory_obj = backend.get_blocking(key)
             if memory_obj:
                 if (
-                    backend_name not in ["LocalCPUBackend", "PDBackend"]
+                    backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
                     and "LocalCPUBackend" in self.storage_backends
                 ):
                     local_cpu_backend = self.storage_backends["LocalCPUBackend"]
@@ -467,7 +480,7 @@ class StorageManager:
         self,
         keys: List[CacheEngineKey],
         location: Optional[str] = None,
-    ) -> Optional[List[Optional[MemoryObj]]]:
+    ) -> List[Optional[MemoryObj]]:
         """
         Blocking function to get the memory objects from the storages.
         """
@@ -475,8 +488,28 @@ class StorageManager:
         for backend_name, storage_backend in self.get_active_storage_backends(location):
             memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
+                # Align with single-key `get()` logic:
+                # auto-write remote data to local CPU cache
+                if (
+                    backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
+                    and "LocalCPUBackend" in self.storage_backends
+                    and None not in memory_objs
+                ):
+                    logger.debug(
+                        "Storing %s objects from %s to LocalCPUBackend",
+                        len(keys),
+                        backend_name,
+                    )
+                    local_cpu_backend = self.storage_backends["LocalCPUBackend"]
+                    assert isinstance(local_cpu_backend, LocalCPUBackend)
+                    # Type cast: Safe (we verified no Nones above)
+                    # `batched_submit_put_task` expects list[MemoryObj]
+                    # TODO (lisiG9): Refactor this write-back logic into caching
+                    #  policy module
+                    memory_objs_no_none = cast(List[MemoryObj], memory_objs)
+                    local_cpu_backend.batched_submit_put_task(keys, memory_objs_no_none)
                 return memory_objs
-        return None
+        return [None] * len(keys)
 
     def layerwise_batched_get(
         self,
@@ -524,10 +557,15 @@ class StorageManager:
         lookup_id: str,
         cum_chunk_lengths_total: list[int],
         tier_expected_chunks: list[int],
+        keys_per_chunk: int = 1,
     ) -> None:
         """
         Callback function when all prefetch tasks
         (i.e., prefetching from all backends for the entire request) are done.
+
+        :param int keys_per_chunk: Number of storage keys per logical chunk
+            (``num_layers`` for layerwise mode, ``1`` otherwise). Used to
+            convert each tier's per-key result count back to chunk units.
         """
         assert self.async_lookup_server is not None
         self.event_manager.update_event_status(
@@ -580,16 +618,26 @@ class StorageManager:
         #   retrieved_length = cum_chunk_lengths_total[2] = 512
         total_retrieved_chunks = 0
         for tier_idx, tier_result in enumerate(res):
-            actual_chunks = len(tier_result)
+            # `tier_result` is a list of (key, mem_obj) pairs, one per
+            # storage key. With layerwise on, each logical chunk maps to
+            # keys_per_chunk per-layer keys, so divide to get chunk count.
+            # We round down so a partially-retrieved chunk (e.g., one
+            # layer evicted) is treated as a miss.
+            actual_chunks = len(tier_result) // keys_per_chunk
             expected_chunks = tier_expected_chunks[tier_idx]
             total_retrieved_chunks += actual_chunks
+
+            # Release the tail rounded off by actual_chunks; else staging buffer leaks.
+            tail_start = actual_chunks * keys_per_chunk
+            for _, mem_obj in tier_result[tail_start:]:
+                mem_obj.ref_count_down()
 
             # If a tier retrieved fewer chunks than expected, we stop counting
             # because subsequent chunks are not contiguous
             if actual_chunks < expected_chunks:
                 # Release all chunks in subsequent tiers since they won't be used
                 for subsequent_tier in res[tier_idx + 1 :]:
-                    for mem_obj in subsequent_tier:
+                    for _, mem_obj in subsequent_tier:
                         mem_obj.ref_count_down()
                 break
 
@@ -607,6 +655,7 @@ class StorageManager:
         cum_chunk_lengths: list[int],
         search_range: Optional[list[str]] = None,
         pin: bool = False,
+        keys_per_chunk: int = 1,
     ) -> None:
         """
         Perform asynchronous lookup and prefetching across all storage backends.
@@ -621,11 +670,19 @@ class StorageManager:
                 - chunk 1: 256 tokens (tokens 256-511)
                 - chunk 2: 128 tokens (tokens 512-639)
             Then cum_chunk_lengths = [0, 256, 512, 640]
-            Note: len(cum_chunk_lengths) = len(keys) + 1
+            Note: len(cum_chunk_lengths) = (len(keys) // keys_per_chunk) + 1
         :param Optional[list[str]] search_range: The range of storage backends
         to search in. Should be a subset of ["LocalCPUBackend",
         "LocalDiskBackend"] for now. If None, search in all backends.
         :param bool pin: Whether to pin the keys.
+        :param int keys_per_chunk: Number of storage keys per logical chunk.
+            For non-layerwise mode this is 1 (one key per chunk). For
+            layerwise mode the caller passes num_layers, since each chunk
+            is stored as num_layers per-layer keys (LayerCacheEngineKey).
+            All chunk-level accounting below is derived from
+            num_hit_keys // keys_per_chunk so that hit counts and
+            cum_chunk_lengths indexing stay in chunk units even though the
+            backend operates on per-layer keys.
         """
 
         # NOTE(Jiayi): Currently, the retrieval pattern is always
@@ -640,7 +697,19 @@ class StorageManager:
         # chunks than its lookup result indicated. This is especially helpful
         # for P2PBackend.
 
-        num_total_chunks = len(keys)
+        # All chunk-level accounting (num_total_chunks, num_total_hit_chunks,
+        # tier_expected_chunks, cum_chunk_lengths indexing) is in *chunk*
+        # units, while raw key indexing into `keys` is in *key* units.
+        # When keys_per_chunk == 1 these are identical; when layerwise is
+        # on, each chunk corresponds to num_layers keys.
+        if keys_per_chunk < 1:
+            raise ValueError(f"keys_per_chunk must be >= 1, got {keys_per_chunk}")
+        if len(keys) % keys_per_chunk != 0:
+            raise ValueError(
+                f"len(keys)={len(keys)} is not a multiple of "
+                f"keys_per_chunk={keys_per_chunk}"
+            )
+        num_total_chunks = len(keys) // keys_per_chunk
         num_total_hit_chunks = 0
         # cum_chunk_lengths_total: A copy of the original cumulative chunk lengths
         # for all chunks. This is preserved to calculate the final token count
@@ -657,7 +726,23 @@ class StorageManager:
         for backend_name, backend in self.get_active_storage_backends(
             search_range=search_range
         ):
-            num_hit_chunks = await backend.batched_async_contains(lookup_id, keys, pin)
+            num_hit_keys_raw = await backend.batched_async_contains(
+                lookup_id, keys, pin
+            )
+            # Round down to a whole-chunk boundary. If a backend has only
+            # some of a chunk's per-layer keys (e.g., partial eviction),
+            # we treat the chunk as a miss to keep the chunk-level
+            # invariant required by the prefix-match retrieval pattern.
+            num_hit_chunks = num_hit_keys_raw // keys_per_chunk
+            num_hit_keys = num_hit_chunks * keys_per_chunk
+
+            # `pin=True` pins every matching key inside batched_async_contains.
+            # The rounded-off tail (keys[num_hit_keys:num_hit_keys_raw]) is
+            # dropped from backend_keys and never retrieved, so release those
+            # pins here to avoid leaking refcount budget.
+            if pin and num_hit_keys < num_hit_keys_raw:
+                for k in keys[num_hit_keys:num_hit_keys_raw]:
+                    backend.unpin(k)
 
             if num_hit_chunks == 0:
                 continue
@@ -665,7 +750,7 @@ class StorageManager:
             num_total_hit_chunks += num_hit_chunks
             tier_expected_chunks.append(num_hit_chunks)
 
-            backend_keys = keys[:num_hit_chunks]
+            backend_keys = keys[:num_hit_keys]
             loading_task_keys.append(backend_keys)
 
             assert self.async_serializer is not None, (
@@ -696,7 +781,7 @@ class StorageManager:
 
             if num_total_hit_chunks == num_total_chunks:
                 break
-            keys = keys[num_hit_chunks:]
+            keys = keys[num_hit_keys:]
 
         # If no chunks were hit across all backends, respond immediately and return.
         if num_total_hit_chunks == 0:
@@ -736,8 +821,41 @@ class StorageManager:
                 lookup_id,
                 cum_chunk_lengths_total,
                 tier_expected_chunks,
+                keys_per_chunk=keys_per_chunk,
             )
         )
+
+    def set_hot_cache(self, enabled: bool) -> None:
+        """
+        Dynamically enable or disable the hot cache on LocalCPUBackend.
+
+        When disabled, the existing hot cache entries will be cleared
+        and no new data will be written to the hot cache.
+
+        Args:
+            enabled: True to enable hot cache, False to disable
+        """
+        backend = self.local_cpu_backend
+        if not isinstance(backend, LocalCPUBackend):
+            logger.warning("Cannot set hot_cache: LocalCPUBackend not available")
+            return
+
+        if not enabled:
+            backend.clear()
+        backend.use_hot = enabled
+        logger.info("LocalCPUBackend hot_cache set to %s", enabled)
+
+    def is_hot_cache_enabled(self) -> bool:
+        """
+        Get the current hot cache status of LocalCPUBackend.
+
+        Returns:
+            bool: True if hot cache is enabled, False otherwise
+        """
+        backend = self.local_cpu_backend
+        if not isinstance(backend, LocalCPUBackend):
+            return False
+        return backend.use_hot
 
     def set_freeze(self, enabled: bool) -> None:
         """
@@ -758,6 +876,61 @@ class StorageManager:
         """
         with self._freeze_lock:
             return self._freeze
+
+    def set_backend_bypass(self, backend_name: str, bypassed: bool) -> None:
+        """
+        Set bypass mode for a specific backend.
+
+        When a backend is bypassed:
+        - It will be skipped during contains/put/get operations
+        - This is typically used when a health check fails with LOCAL_CPU fallback
+
+        Args:
+            backend_name: The name of the backend to bypass (e.g., "RemoteBackend")
+            bypassed: True to bypass, False to restore normal operation
+        """
+        with self._bypass_lock:
+            if bypassed:
+                self._bypassed_backends.add(backend_name)
+                logger.info(f"StorageManager: Backend {backend_name} is now bypassed")
+            else:
+                self._bypassed_backends.discard(backend_name)
+                logger.info(
+                    f"StorageManager: Backend {backend_name} bypass removed, "
+                    "restored to normal operation"
+                )
+
+    def is_backend_bypassed(self, backend_name: str) -> bool:
+        """
+        Check if a backend is currently bypassed.
+
+        Args:
+            backend_name: The name of the backend to check
+
+        Returns:
+            bool: True if the backend is bypassed, False otherwise
+        """
+        with self._bypass_lock:
+            return backend_name in self._bypassed_backends
+
+    def get_bypassed_backends(self) -> List[str]:
+        """
+        Get the list of currently bypassed backend names.
+
+        Returns:
+            List[str]: List of bypassed backend names
+        """
+        with self._bypass_lock:
+            return list(self._bypassed_backends)
+
+    def get_all_backend_names(self) -> List[str]:
+        """
+        Get the list of all registered backend names.
+
+        Returns:
+            List[str]: List of all backend names
+        """
+        return list(self.storage_backends.keys())
 
     def contains(
         self,
@@ -861,7 +1034,7 @@ class StorageManager:
             keys = keys[hit_chunks:]
         return block_mapping
 
-    def touch_cache(self):
+    def touch_cache(self) -> None:
         for backend_name, backend in self.storage_backends.items():
             if backend_name == "LocalCPUBackend" or backend_name == "LocalDiskBackend":
                 backend.touch_cache()
@@ -991,7 +1164,7 @@ class StorageManager:
         search_range: Optional[List[str]] = None,
     ) -> Generator[Tuple[str, StorageBackendInterface], None, None]:
         """
-        Get the active storage backends based on freeze mode and filters.
+        Get the active storage backends based on freeze mode, bypass mode, and filters.
 
         :param Optional[str] location: If specified, only yield backends
             matching this exact name.
@@ -1004,6 +1177,10 @@ class StorageManager:
             # In freeze mode, only use local_cpu backend
             with self._freeze_lock:
                 if self._freeze and backend_name != "LocalCPUBackend":
+                    continue
+            # Skip bypassed backends
+            with self._bypass_lock:
+                if backend_name in self._bypassed_backends:
                     continue
             if location and backend_name != location:
                 continue
@@ -1027,6 +1204,183 @@ class StorageManager:
                 continue
             storage_names.append(backend_name)
         return storage_names
+
+    def list_backends(self) -> Dict[str, str]:
+        """
+        List all active storage backends.
+
+        Returns:
+            Dict mapping backend name to its class name.
+        """
+        with self.manager_lock:
+            return {
+                name: type(backend).__name__
+                for name, backend in self.storage_backends.items()
+            }
+
+    def close_backend(self, backend_name: str) -> bool:
+        """
+        Close and remove a specific storage backend by name.
+
+        The backend will be closed and removed from the internal
+        dict so that no stale references remain.
+
+        Args:
+            backend_name: The name of the backend to close.
+
+        Returns:
+            True if the backend was found and closed, False
+            otherwise.
+        """
+        with self.manager_lock:
+            backend = self.storage_backends.get(backend_name)
+            if backend is None:
+                logger.warning(
+                    "Backend %s not found, cannot close",
+                    backend_name,
+                )
+                return False
+
+            try:
+                logger.info("Closing backend: %s", backend_name)
+                backend.close()
+            except Exception:
+                logger.exception("Error closing backend %s", backend_name)
+
+            del self.storage_backends[backend_name]
+
+            # Update derived references
+            self.non_allocator_backends = self.get_non_allocator_backends()
+            if backend_name == "LocalCPUBackend":
+                self.local_cpu_backend = None
+            logger.info("Backend %s closed and removed", backend_name)
+            return True
+
+    def create_backends(self) -> Dict[str, str]:
+        """
+        Create new storage backends based on current config.
+
+        Backends that are already present will be skipped
+        **before** instantiation so that no unnecessary
+        resources are allocated.  This allows callers to close
+        a subset of backends, update config via ``/conf``,
+        and then call this method to bring up only the missing
+        backends.
+
+        Returns:
+            Dict mapping newly created backend name to its
+            class name.
+        """
+        with self.manager_lock:
+            existing_names = set(self.storage_backends)
+            new_backends = CreateStorageBackends(
+                self.config,
+                self.metadata,
+                self.loop,
+                dst_device=(
+                    torch_device_type if is_cuda_worker(self.metadata) else "cpu"
+                ),
+                lmcache_worker=self.lmcache_worker,
+                skip_backends=existing_names,
+                existing_backends=self.storage_backends,
+            )
+
+            created: Dict[str, str] = {}
+            for name, backend in new_backends.items():
+                self.storage_backends[name] = backend
+                created[name] = type(backend).__name__
+                logger.info(
+                    "Created backend: %s (%s)",
+                    name,
+                    created[name],
+                )
+
+            # Refresh derived references
+            self.non_allocator_backends = self.get_non_allocator_backends()
+            cpu = self.storage_backends.get("LocalCPUBackend")
+            if cpu is not None:
+                self.local_cpu_backend = cpu
+
+            return created
+
+    def recreate_backend(self, backend_name: str) -> Dict[str, str]:
+        """
+        Close a backend and recreate it from current config.
+
+        This is an atomic close-then-create operation that
+        combines :meth:`close_backend` and :meth:`create_backends`
+        into a single step.
+
+        Args:
+            backend_name: Name of the backend to recreate
+                (e.g. ``RemoteBackend``).
+
+        Returns:
+            Dict mapping newly created backend name to its
+            class name.
+
+        Raises:
+            KeyError: If *backend_name* does not exist.
+        """
+        with self.manager_lock:
+            backend = self.storage_backends.get(backend_name)
+            if backend is None:
+                raise KeyError("Backend %s not found" % backend_name)
+
+            # --- close ---
+            try:
+                logger.info("Closing backend: %s", backend_name)
+                backend.close()
+            except Exception:
+                logger.exception("Error closing backend %s", backend_name)
+            del self.storage_backends[backend_name]
+
+            # --- create ---
+            existing_names = set(self.storage_backends)
+            new_backends = CreateStorageBackends(
+                self.config,
+                self.metadata,
+                self.loop,
+                dst_device=(
+                    torch_device_type if is_cuda_worker(self.metadata) else "cpu"
+                ),
+                lmcache_worker=self.lmcache_worker,
+                skip_backends=existing_names,
+                existing_backends=self.storage_backends,
+            )
+
+            created: Dict[str, str] = {}
+            for name, be in new_backends.items():
+                self.storage_backends[name] = be
+                created[name] = type(be).__name__
+                logger.info(
+                    "Recreated backend: %s (%s)",
+                    name,
+                    created[name],
+                )
+
+            # Refresh derived references
+            self.non_allocator_backends = self.get_non_allocator_backends()
+            cpu = self.storage_backends.get("LocalCPUBackend")
+            if cpu is not None:
+                self.local_cpu_backend = cpu
+            elif backend_name == "LocalCPUBackend":
+                self.local_cpu_backend = None
+
+            return created
+
+    def cancel_request(self, req_id: str) -> None:
+        """
+        Cancel an in-flight or pending request.
+
+        Delegates to all storage backends. Backends that track per-request
+        state will cancel the request; others will no-op.
+
+        :param str req_id: The request identifier to cancel.
+        :return: None
+        """
+        for backend in self.storage_backends.values():
+            backend.cancel_request(req_id)
 
     def close(self):
         logger.info("Closing StorageManager...")

@@ -1,20 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import TYPE_CHECKING, Optional, Union
+from typing import Optional, Union
 
 # Third Party
 import torch
 
 # First Party
-from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
-
-if TYPE_CHECKING:
-    # Third Party
-    from vllm.config import VllmConfig
+from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
+    MooncakeStoreConfig,
+    setup_mooncake_store,
+)
 
 logger = init_logger(__name__)
 
@@ -22,24 +22,28 @@ logger = init_logger(__name__)
 class MooncakeLookupClient(LookupClientInterface):
     def __init__(
         self,
-        vllm_config: "VllmConfig",
         config: LMCacheEngineConfig,
-        metadata: LMCacheEngineMetadata,
+        metadata: LMCacheMetadata,
         master_addr: str,
     ):
         # Third Party
         from mooncake.store import MooncakeDistributedStore
 
         self.store = MooncakeDistributedStore()
-        self.store.setup(
-            "localhost",
-            "P2PHANDSHAKE",
-            0,
-            16 * 1024 * 1024,
-            "tcp",
-            "",
-            master_addr,
+        # Deprecated
+        # TODO(baoloongmao): use dict config instead in the future
+        lookup_config = MooncakeStoreConfig(
+            setup_config={
+                "local_hostname": "localhost",
+                "metadata_server": "P2PHANDSHAKE",
+                "global_segment_size": "0",
+                "local_buffer_size": str(16 * 1024 * 1024),
+                "protocol": "tcp",
+                "device_name": "",
+                "master_server_address": master_addr,
+            },
         )
+        setup_mooncake_store(self.store, lookup_config)
 
         # Initialize token database for processing tokens
         assert isinstance(config, LMCacheEngineConfig), (
@@ -59,7 +63,6 @@ class MooncakeLookupClient(LookupClientInterface):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: Optional[str] = None,
         request_configs: Optional[dict] = None,
-        num_computed_tokens: int = 0,
     ) -> Optional[int]:
         # process token_ids to cacheengine keys
         keys = []

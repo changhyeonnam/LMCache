@@ -21,14 +21,40 @@ from transformers import AutoTokenizer
 import torch
 
 # First Party
-from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.metadata import LMCacheMetadata
 
 logger = init_logger(__name__)
 
-NONE_HASH: int
+NONE_HASH = 0
+
+
+def _normalize_hash_to_int(hash_value: Union[int, bytes]) -> int:
+    """Normalize hash outputs to LMCache's int chunk-hash representation.
+
+    This function is triggered when vLLM's ``sha256_cbor`` hash function is
+    used because it returns a 32-byte digest. vLLM's
+    ``kv_cache_utils.init_none_hash`` can therefore initialize ``NONE_HASH`` as
+    bytes, and direct hash calls for token chunks can also return bytes.
+
+    LMCache stores chunk hashes in ``CacheEngineKey`` and serializes them with
+    msgpack, so byte digests must be folded into uint64-compatible ints before
+    they enter the prefix hash chain. This also keeps ``NONE_HASH`` and later
+    prefix hashes using the same structural type for CBOR hashing.
+
+    Args:
+        hash_value: Hash output from vLLM or Python's builtin hash.
+
+    Returns:
+        The original int hash value, or the first eight bytes of a digest as a
+        big-endian int.
+    """
+    if isinstance(hash_value, bytes):
+        return int.from_bytes(hash_value[:8], "big")
+    return hash_value
+
 
 # Type alias for process_tokens return value
 # (start_index, end_index, cache_engine_key｜hash)
@@ -50,7 +76,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
     def __init__(
         self,
         config: Optional[LMCacheEngineConfig] = None,
-        metadata: Optional[LMCacheEngineMetadata] = None,
+        metadata: Optional[LMCacheMetadata] = None,
     ):
         global NONE_HASH
 
@@ -70,7 +96,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
 
             if hasattr(kv_cache_utils, "init_none_hash"):
                 kv_cache_utils.init_none_hash(self.hash_func)
-                NONE_HASH = kv_cache_utils.NONE_HASH
+                NONE_HASH = _normalize_hash_to_int(kv_cache_utils.NONE_HASH)
                 logger.info(
                     f"Initialized NONE_HASH={NONE_HASH} from vLLM (>= PR#20511)"
                 )
@@ -81,7 +107,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             NONE_HASH = 0
             logger.info("Using default NONE_HASH=0 (vLLM not available)")
 
-        logger.info(f"Using hash algorithm: {hash_algorithm}")
+        logger.info("Using hash algorithm: %s", hash_algorithm)
         self.metadata = metadata
         # Whether only the first rank should save cache. This flag is also used
         # to control the logical world_size embedded into CacheEngineKey.
@@ -161,7 +187,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         for name in names_to_try:
             try:
                 hash_func = get_hash_fn_by_name(name)
-                logger.info(f"Loaded '{name}' from {module_name}")
+                logger.info("Loaded '%s' from %s", name, module_name)
                 return hash_func
             except ValueError:
                 continue
@@ -212,13 +238,31 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         # collapse the CacheEngineKey.world_size to 1 so that cache keys
         # become world-size agnostic across compatible deployments.
         return CacheEngineKey(
-            self.metadata.fmt,
             self.metadata.model_name,
             self.metadata.world_size if not self.save_only_first_rank else 1,
             self.metadata.worker_id,
             chunk_hash,
             self.metadata.kv_dtype,
             request_configs,
+        )
+
+    def _canonicalize_hash_inputs(
+        self,
+        prefix_hash: Optional[int],
+        tokens_tuple: Tuple[int, ...],
+        extra_keys: Optional[List[Any]],
+    ) -> Tuple[int, Tuple[int, ...], Tuple[Any, ...]]:
+        """
+        Canonicalize hash inputs so that semantically identical requests
+        produce structurally identical hash inputs across instances.
+        - prefix_hash: int or NONE_HASH if None
+        - tokens_tuple: tuple of token IDs
+        - extra_keys: tuple of additional keys, empty if None
+        """
+        return (
+            prefix_hash if prefix_hash is not None else NONE_HASH,
+            tokens_tuple,
+            tuple(extra_keys) if extra_keys is not None else (),
         )
 
     def _hash_tokens(
@@ -237,20 +281,30 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         # Ignore extra keys for now
         # Extra keys are for multi-modal inputs and
         # request specific metadata (e.g., LoRA ID).
-        return self.hash_func((prefix_hash, tokens_tuple, extra_keys))
+        # Use default values for None to maintain a fixed tuple structure for hashing.
+
+        # Use helper to canonicalize inputs to ensure consistent hashing
+        # This replaces the logic that was causing inconsistency
+        canon_prefix, canon_tokens, canon_extra = self._canonicalize_hash_inputs(
+            prefix_hash, tokens_tuple, extra_keys
+        )
+
+        return _normalize_hash_to_int(
+            self.hash_func((canon_prefix, canon_tokens, canon_extra))
+        )
 
 
 class ChunkedTokenDatabase(TokenDatabase):
     def __init__(
         self,
         config: Optional[LMCacheEngineConfig] = None,
-        metadata: Optional[LMCacheEngineMetadata] = None,
+        metadata: Optional[LMCacheMetadata] = None,
     ):
         super(ChunkedTokenDatabase, self).__init__(config, metadata)
 
         if config is not None:
+            self.config = config
             self.chunk_size = config.chunk_size
-            self.save_unfull_chunk = config.save_unfull_chunk
 
             # Check for cross-process cache sharing setup
             if os.getenv("PYTHONHASHSEED") is None:
@@ -270,8 +324,8 @@ class ChunkedTokenDatabase(TokenDatabase):
                         "This will cause incorrect KV cache transfer."
                     )
         else:  # Default values
+            self.config = None
             self.chunk_size = 256
-            self.save_unfull_chunk = True
 
     def _get_init_hash(self) -> int:
         return NONE_HASH
@@ -289,9 +343,12 @@ class ChunkedTokenDatabase(TokenDatabase):
         :return: a generator of chunks of tokens, each with
                 shape [chunk_size]
         """
+        save_unfull_chunk = (
+            self.config.save_unfull_chunk if self.config is not None else True
+        )
         end = (
             len(tokens)
-            if self.save_unfull_chunk
+            if save_unfull_chunk
             else (len(tokens) - len(tokens) % self.chunk_size)
         )
         for i in range(0, end, self.chunk_size):
@@ -397,7 +454,7 @@ class SegmentTokenDatabase(TokenDatabase):
     In the future, we might need to implement a fast substring match.
     """
 
-    def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheEngineMetadata):
+    def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheMetadata):
         super(SegmentTokenDatabase, self).__init__(config, metadata)
 
         self.tokenizer = AutoTokenizer.from_pretrained(metadata.model_name)

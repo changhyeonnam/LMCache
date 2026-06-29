@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from typing import Optional
 import argparse
 import asyncio
+import itertools
 import json
+import math
 import os
 import time
 
@@ -23,9 +25,57 @@ import zmq.asyncio
 from lmcache.logging import init_logger
 from lmcache.v1.storage_backend.pd_backend import (
     PDMsg,
+    ProxyNotif,
 )
 
 logger = init_logger(__name__)
+
+
+class WeightedSemaphore:
+    """Async semaphore with variable-weight acquire.
+
+    Limits in-flight PD token usage: each request holds ceil(L/chunk_size)
+    slots until decoding starts, preventing decoder buffer exhaustion deadlocks.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self._available = capacity
+        self._lock = asyncio.Condition()
+
+    async def acquire(self, slots: int) -> None:
+        """Acquire *slots* from the semaphore, blocking until available.
+
+        Args:
+            slots: Number of slots to acquire (must be <= capacity).
+
+        Raises:
+            ValueError: If slots exceeds total capacity (would block forever).
+        """
+        if slots > self._capacity:
+            raise ValueError(
+                f"Requested {slots} slots exceeds total capacity {self._capacity}"
+            )
+        async with self._lock:
+            await self._lock.wait_for(lambda: self._available >= slots)
+            self._available -= slots
+
+    async def release(self, slots: int) -> None:
+        """Return *slots* to the semaphore and wake waiting acquirers.
+
+        Args:
+            slots: Number of slots to release. No-op if <= 0.
+        """
+        if slots <= 0:
+            return
+        async with self._lock:
+            self._available += slots
+            self._lock.notify_all()
+
+    @property
+    def available(self) -> int:
+        """Number of slots currently available."""
+        return self._available
 
 
 @asynccontextmanager
@@ -123,6 +173,22 @@ async def lifespan(app: FastAPI):
 
     app.state.zmq_task = asyncio.create_task(zmq_pull_server())
 
+    global pd_buffer_semaphore
+    kv_bytes_per_token = compute_kv_bytes_per_token(global_args.model)
+    capacity_slots = global_args.pd_buffer_size // (
+        kv_bytes_per_token * global_args.chunk_size
+    )
+    pd_buffer_semaphore = WeightedSemaphore(capacity_slots)
+    logger.info(
+        "PD buffer semaphore: capacity=%d slots"
+        " (%d bytes / (%d bytes/tok * %d chunk_size)) for model %s.",
+        capacity_slots,
+        global_args.pd_buffer_size,
+        kv_bytes_per_token,
+        global_args.chunk_size,
+        global_args.model,
+    )
+
     yield
 
     # Shutdown: Close clients
@@ -180,6 +246,31 @@ def csv_strs(s):
     return [x.strip() for x in s.split(",")]
 
 
+def compute_kv_bytes_per_token(model_name: str) -> int:
+    """Return the number of KV cache bytes per token for *model_name*.
+
+    Reads num_hidden_layers, num_key_value_heads, head_dim, and torch_dtype
+    from the HuggingFace config without downloading model weights.
+
+    Args:
+        model_name: HuggingFace model id or local path.
+
+    Returns:
+        Bytes per token across all layers and both K/V tensors.
+    """
+    # Third Party
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(model_name)
+    num_layers: int = cfg.num_hidden_layers
+    num_kv_heads: int = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+    head_dim: int = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
+    # 4 bytes for float32, 2 bytes for float16/bfloat16 (the common default)
+    torch_dtype = str(getattr(cfg, "torch_dtype", "bfloat16"))
+    dtype_bytes = 4 if "float32" in torch_dtype else 2
+    return 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
 
@@ -196,6 +287,36 @@ def parse_args():
     parser.add_argument("--num-decoders", type=int, default=1)
     parser.add_argument("--proxy-host", type=str, default="localhost")
     parser.add_argument("--proxy-port", type=int, default=8500)
+
+    # PD buffer concurrency limiting. A weighted semaphore caps in-flight
+    # chunk slots to prevent decoder buffer exhaustion deadlocks.
+    # capacity_slots = pd_buffer_size // (kv_bytes_per_token * chunk_size)
+    # kv_bytes_per_token is derived from the model config automatically.
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="meta-llama/Llama-3.1-8B-Instruct",
+        help=(
+            "HuggingFace model name or local path. Used to derive"
+            " kv_bytes_per_token for the PD buffer semaphore capacity."
+        ),
+    )
+    parser.add_argument(
+        "--pd-buffer-size",
+        type=int,
+        default=2 * 1024 * 1024 * 1024,  # 2 GB
+        help=(
+            "PD transfer buffer size in bytes (must match the decoder's"
+            " LMCache config). Used to derive the in-flight slot capacity."
+            " Default: 2 GB."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=256,
+        help="LMCache chunk size in tokens (must match the LMCache config).",
+    )
 
     args = parser.parse_args()
     return args
@@ -214,8 +335,17 @@ app.state.prefill_clients = []
 app.state.decode_clients = []
 app.state.total_clients = []
 
+"""
+client_request and prefill/decode map
+key:   str    - unique id for requests across same conversation
+value: tuple  - (tokenization_client, prefiller_client, decoder_client)
+"""
+app.state.bound_clients = {}
+
 # Keep finished reqs
 app.state.finished_reqs = defaultdict(int)
+
+pd_buffer_semaphore: Optional[WeightedSemaphore] = None
 
 
 zmq_ctx = zmq.asyncio.Context()
@@ -225,21 +355,42 @@ run_proxy = True  # Shutdown flag
 async def zmq_pull_server():
     socket = zmq_ctx.socket(zmq.PULL)
     proxy_url = f"{global_args.proxy_host}:{global_args.proxy_port}"
-    socket.bind(f"tcp://{proxy_url}")
-    logger.info(f"ZMQ proxy server started on {proxy_url}")
+    try:
+        socket.bind(f"tcp://{proxy_url}")
+    except zmq.ZMQError:
+        logger.exception("ZMQ proxy server failed to bind on %s", proxy_url)
+        return
+    logger.info("ZMQ proxy server started on %s", proxy_url)
 
     while run_proxy:
         try:
             msg_bytes = await socket.recv()
-            msg = msgspec.msgpack.decode(msg_bytes, type=PDMsg)
-            req_id = msg.req_id
-            app.state.finished_reqs[req_id] += 1
-            logger.debug(f"Prefill of req {req_id} done.")
         except zmq.Again:
             await asyncio.sleep(0.01)  # Avoid busy loop
-        except Exception as e:
-            print("ZMQ Error:", e)
-            break
+            continue
+        except zmq.ZMQError as exc:
+            if exc.errno in (zmq.ETERM, zmq.ENOTSOCK):
+                break
+            logger.warning("ZMQ recv error: %s", exc)
+            await asyncio.sleep(0.05)
+            continue
+
+        try:
+            msg = msgspec.msgpack.decode(msg_bytes, type=PDMsg)
+        except msgspec.DecodeError as exc:
+            logger.warning("ZMQ received non-PD message: %s", exc)
+            continue
+        except Exception as exc:
+            logger.exception("ZMQ message decode failed: %s", exc)
+            continue
+
+        if not isinstance(msg, ProxyNotif):
+            logger.debug("ZMQ ignored message type: %s", type(msg).__name__)
+            continue
+
+        req_id = msg.req_id
+        app.state.finished_reqs[req_id] += 1
+        logger.debug("Prefill of req %s done.", req_id)
 
     socket.close()
     logger.info("ZMQ PULL server stopped.")
@@ -277,11 +428,47 @@ def round_robin_pick_client(clients, idx):
     return clients[idx % len(clients)]
 
 
+round_robin_counter = itertools.count()
+
+
+def round_robin_pick_clients() -> tuple[ClientInfo, ClientInfo, ClientInfo]:
+    idx = next(round_robin_counter)
+    tokenization_client = round_robin_pick_client(app.state.total_clients, idx)
+    prefill_client = round_robin_pick_client(app.state.prefill_clients, idx)
+    decode_client = round_robin_pick_client(app.state.decode_clients, idx)
+    return tokenization_client, prefill_client, decode_client
+
+
 async def wait_decode_kv_ready(req_id: str, num_tp_rank: int):
     while app.state.finished_reqs[req_id] < num_tp_rank:
         await asyncio.sleep(0.0001)  # sleep for 0.1 ms
     logger.debug(f"Prefill node signaled kv ready for req {req_id}")
     app.state.finished_reqs.pop(req_id)
+
+
+BOUND_CLIENTS_MAX_NUM = 1024 * 1024
+
+
+def pick_up_bound_clients(client_id: str) -> tuple[ClientInfo, ClientInfo, ClientInfo]:
+    if client_id not in app.state.bound_clients:
+        if len(app.state.bound_clients) >= BOUND_CLIENTS_MAX_NUM:
+            # Here simply clear the bound_clients if full
+            app.state.bound_clients.clear()
+        app.state.bound_clients[client_id] = round_robin_pick_clients()
+    return app.state.bound_clients[client_id]
+
+
+BOUND_CLIENT = os.getenv("CLIENT_BOUND", "false").lower() == "true"
+# CLIENT_BOUND_KEY, the field name of the client uid in http request
+CLIENT_BOUND_KEY = os.getenv("CLIENT_BOUND_KEY", "session-id")
+
+
+def pick_up_clients(request: Request) -> tuple[ClientInfo, ClientInfo, ClientInfo]:
+    bound_client_id = request.headers.get(CLIENT_BOUND_KEY) if BOUND_CLIENT else None
+    if bound_client_id:
+        # Use or create a persistent set of clients for the session.
+        return pick_up_bound_clients(bound_client_id)
+    return round_robin_pick_clients()
 
 
 @app.post("/v1/completions")
@@ -291,10 +478,13 @@ async def handle_completions(request: Request):
     req_id = str(counter)  # we use counter as req_id
 
     st = time.time()
+    slots = 0  # slots to release on error; set after successful acquire only
+    acquired = False
     try:
         req_data = await request.json()
 
-        tokenization_client = round_robin_pick_client(app.state.total_clients, counter)
+        # Pick tokenization, prefill and decode client
+        tokenization_client, prefill_client, decode_client = pick_up_clients(request)
 
         tokenize_output = await send_request_to_service(
             tokenization_client.client, "/tokenize", {"prompt": req_data["prompt"]}
@@ -305,8 +495,11 @@ async def handle_completions(request: Request):
         req_data["prompt"] = tokenize_output["tokens"]
         req_data["max_tokens"] = 1
 
-        # Pick decode client
-        decode_client = round_robin_pick_client(app.state.decode_clients, counter)
+        # Acquire ceil(L/chunk_size) PD buffer slots before prefill.
+        slots = math.ceil(len(tokenize_output["tokens"]) / global_args.chunk_size)
+        if pd_buffer_semaphore is not None:
+            await pd_buffer_semaphore.acquire(slots)
+            acquired = True
 
         disagg_spec = {
             "req_id": req_id,
@@ -314,7 +507,7 @@ async def handle_completions(request: Request):
             "receiver_init_port": decode_client.init_port,
             "receiver_alloc_port": decode_client.alloc_port,
         }
-        num_tp_rank = len(decode_client.init_port)
+        num_tp_rank = len(decode_client.init_port or [])
 
         req_data["kv_transfer_params"] = {
             "ret_first_tok": True,
@@ -324,8 +517,7 @@ async def handle_completions(request: Request):
         req_data["stream"] = False
         stream_options = req_data.pop("stream_options", None)
 
-        # Send request to prefill service round robin, ignore the response
-        prefill_client = round_robin_pick_client(app.state.prefill_clients, counter)
+        # Send request to prefill service, ignore the response
         prefill_output = await send_request_to_service(
             prefill_client.client, "/v1/completions", req_data
         )
@@ -364,8 +556,11 @@ async def handle_completions(request: Request):
                 "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
             ).encode()
 
-            # Wait until decode node signals that kv is ready
-            await wait_decode_kv_ready(req_id, num_tp_rank)
+            try:
+                await wait_decode_kv_ready(req_id, num_tp_rank)
+            finally:
+                if pd_buffer_semaphore is not None:
+                    await pd_buffer_semaphore.release(slots)
 
             async for chunk in stream_service_response(
                 decode_client.client, "/v1/completions", req_data
@@ -375,6 +570,8 @@ async def handle_completions(request: Request):
         return StreamingResponse(generate_stream(), media_type="application/json")
 
     except Exception as e:
+        if pd_buffer_semaphore is not None and acquired:
+            await pd_buffer_semaphore.release(slots)
         # Standard
         import sys
         import traceback
@@ -393,10 +590,13 @@ async def handle_chat_completions(request: Request):
     req_id = str(counter)
 
     st = time.time()
+    slots = 0  # slots to release on error; set after successful acquire only
+    acquired = False
     try:
         req_data = await request.json()
 
-        tokenization_client = round_robin_pick_client(app.state.total_clients, counter)
+        # Pick tokenization, prefill and decode client
+        tokenization_client, prefill_client, decode_client = pick_up_clients(request)
 
         # For chat completions, we need to tokenize the messages
         tokenize_output = await send_request_to_service(
@@ -413,8 +613,11 @@ async def handle_chat_completions(request: Request):
             org_max_completion_tokens = req_data["max_completion_tokens"]
             req_data["max_completion_tokens"] = 1
 
-        # Pick decode client
-        decode_client = round_robin_pick_client(app.state.decode_clients, counter)
+        # Acquire ceil(L/chunk_size) PD buffer slots before prefill.
+        slots = math.ceil(len(tokenize_output["tokens"]) / global_args.chunk_size)
+        if pd_buffer_semaphore is not None:
+            await pd_buffer_semaphore.acquire(slots)
+            acquired = True
 
         disagg_spec = {
             "req_id": req_id,
@@ -423,7 +626,7 @@ async def handle_chat_completions(request: Request):
             "receiver_alloc_port": decode_client.alloc_port,
         }
 
-        num_tp_rank = len(decode_client.init_port)
+        num_tp_rank = len(decode_client.init_port or [])
 
         req_data["kv_transfer_params"] = {
             "ret_first_tok": True,
@@ -433,8 +636,7 @@ async def handle_chat_completions(request: Request):
         req_data["stream"] = False
         stream_options = req_data.pop("stream_options", None)
 
-        # Send request to prefill service round robin, get the response
-        prefill_client = round_robin_pick_client(app.state.prefill_clients, counter)
+        # Send request to prefill service, get the response
         prefill_output = await send_request_to_service(
             prefill_client.client, "/v1/completions", req_data
         )
@@ -494,7 +696,11 @@ async def handle_chat_completions(request: Request):
                 "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
             ).encode()
 
-            await wait_decode_kv_ready(req_id, num_tp_rank)
+            try:
+                await wait_decode_kv_ready(req_id, num_tp_rank)
+            finally:
+                if pd_buffer_semaphore is not None:
+                    await pd_buffer_semaphore.release(slots)
 
             # Stream and convert completion format chunks to chat completion format
             async for chunk in stream_service_response(
@@ -546,6 +752,8 @@ async def handle_chat_completions(request: Request):
         return StreamingResponse(generate_stream(), media_type="application/json")
 
     except Exception as e:
+        if pd_buffer_semaphore is not None and acquired:
+            await pd_buffer_semaphore.release(slots)
         # Standard
         import sys
         import traceback

@@ -6,7 +6,7 @@ from typing import Dict, Tuple
 import torch
 
 # First Party
-from lmcache.config import LMCacheEngineConfig, LMCacheEngineMetadata
+from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.storage_backend.serde.cachegen_basics import (
     CacheGenConfig,
@@ -15,11 +15,9 @@ from lmcache.storage_backend.serde.cachegen_basics import (
 )
 from lmcache.storage_backend.serde.serde import Serializer
 from lmcache.utils import _lmcache_nvtx_annotate
-
-if torch.cuda.is_available():
-    import lmcache.c_ops as lmc_ops
-
-# First Party
+from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.metadata import LMCacheMetadata
+import lmcache.c_ops as lmc_ops
 import lmcache.storage_backend.serde.cachegen_basics as CGBasics
 
 logger = init_logger(__name__)
@@ -215,7 +213,9 @@ class CacheGenEncoderImpl:
             results = []
             for x in X:
                 """do permute here"""
-                batch_counts = process_batch(x.cuda().permute(1, 0), max_val)
+                batch_counts = process_batch(
+                    x.to(torch_device_type).permute(1, 0), max_val
+                )
                 results.append(batch_counts)
 
             final_counts = torch.cat(results, dim=0)
@@ -339,10 +339,9 @@ def encode_function(
 
 
 class CacheGenSerializer(Serializer):
-    def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheEngineMetadata):
+    def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheMetadata):
         self.cachegen_config = CacheGenConfig.from_model_name(metadata.model_name)
         self.chunk_size = config.chunk_size
-        self.fmt = metadata.fmt
         self.key_bins = self.make_key_bins(self.cachegen_config)
         self.value_bins = self.make_value_bins(self.cachegen_config)
 
@@ -350,13 +349,13 @@ class CacheGenSerializer(Serializer):
         ret = torch.zeros(config.nlayers)
         for spec in config.kspecs:
             ret[spec.start_layer : spec.end_layer] = spec.bins
-        return ret.cuda()
+        return ret.to(torch_device_type)
 
     def make_value_bins(self, config: CacheGenConfig) -> torch.Tensor:
         ret = torch.zeros(config.nlayers)
         for spec in config.vspecs:
             ret[spec.start_layer : spec.end_layer] = spec.bins
-        return ret.cuda()
+        return ret.to(torch_device_type)
 
     @_lmcache_nvtx_annotate
     def to_bytes(self, tensor: torch.Tensor) -> bytes:
@@ -374,8 +373,8 @@ class CacheGenSerializer(Serializer):
         # Temporary fix for issue #83: encoder will have the default device 0
         # on all the ray workers. Need to set it to the correct device.
         # Also need to figure out why this happens.
-        if torch.cuda.current_device != tensor.device:
-            torch.cuda.set_device(tensor.device)
+        if torch_dev.current_device() != tensor.device.index:
+            torch_dev.set_device(tensor.device)
         if tensor.device != self.key_bins.device:
             self.key_bins = self.key_bins.to(tensor.device)
         if tensor.device != self.value_bins.device:
@@ -383,13 +382,13 @@ class CacheGenSerializer(Serializer):
 
         # TODO: permute is expensive here, need a better way to do it at lower
         # level
-        if self.fmt == "huggingface":
-            tensor = tensor.permute(0, 1, 3, 2, 4)
+        # huggingface:
+        # tensor = tensor.permute(0, 1, 3, 2, 4)
         """ expecting a tensor of shape 
         [num_layers, 2, num_tokens, num_heads, head_size] """
         ntokens = tensor.shape[2]
         output_dict = encode_function(
-            tensor.cuda(),
+            tensor.to(torch_device_type),
             self.cachegen_config,
             self.key_bins,
             self.value_bins,

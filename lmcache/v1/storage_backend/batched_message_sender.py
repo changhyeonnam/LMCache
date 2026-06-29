@@ -5,7 +5,6 @@ import queue
 import threading
 
 # First Party
-from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.observability import PrometheusLogger
 from lmcache.v1.cache_controller.message import (
@@ -14,6 +13,7 @@ from lmcache.v1.cache_controller.message import (
     OpType,
 )
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.metadata import LMCacheMetadata
 
 if TYPE_CHECKING:
     # First Party
@@ -51,14 +51,16 @@ class BatchedMessageSender:
 
     def __init__(
         self,
-        metadata: LMCacheEngineMetadata,
+        metadata: LMCacheMetadata,
         config: LMCacheEngineConfig,
         location: str,
         lmcache_worker: "LMCacheWorker",
-    ):
+    ) -> None:
         self.batch_size = config.get_extra_config_value("kv_msg_batch_size", 50)
         self.batch_timeout = config.get_extra_config_value("kv_msg_batch_timeout", 0.01)
         self.lmcache_worker = lmcache_worker
+        self.metadata = metadata
+        self.config = config
 
         # Common fields shared by all operations in the batch
         self.instance_id = config.lmcache_instance_id
@@ -79,18 +81,22 @@ class BatchedMessageSender:
 
         self._setup_metrics()
 
-    def _setup_metrics(self):
+    def _setup_metrics(self) -> None:
         """Setup metrics for monitoring queue size."""
-        prometheus_logger = PrometheusLogger.GetInstanceOrNone()
-        if prometheus_logger is not None:
-            prometheus_logger.kv_msg_queue_size.set_function(
-                lambda: self.message_queue.qsize()
-            )
+        prometheus_logger = PrometheusLogger.GetOrCreate(
+            self.metadata,
+            config=self.config,
+        )
+        prometheus_logger.kv_msg_queue_size.set_function(
+            lambda: self.message_queue.qsize()
+        )
 
     def _start_background_thread(self):
         """Start background thread for periodic flushing."""
         self.running = True
-        self.thread = threading.Thread(target=self._consumer_loop, daemon=True)
+        self.thread = threading.Thread(
+            target=self._consumer_loop, daemon=True, name="batched-msg-sender-thread"
+        )
         self.thread.start()
 
     def _consumer_loop(self):

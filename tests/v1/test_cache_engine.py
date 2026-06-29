@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import OrderedDict
 from copy import deepcopy
+from unittest.mock import MagicMock, patch
 import os
 import random
 import shlex
@@ -14,10 +16,11 @@ import torch
 
 # First Party
 from lmcache.utils import (
+    CacheEngineKey,
     mock_up_broadcast_fn,
     mock_up_broadcast_object_fn,
 )
-from lmcache.v1.cache_engine import LMCacheEngineBuilder
+from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventStatus, EventType
 
@@ -26,11 +29,19 @@ from .utils import (
     DummyLMCacheAsyncLookupServer,
     check_paged_kv_cache_equal,
     create_gpu_connector,
+    create_test_memory_obj,
     dumb_metadata,
     generate_kv_cache_paged_list_tensors,
     generate_tokens,
+    has_cufile,
     recover_engine_states,
 )
+
+# Optional override for tempfile root. In CI we point this at a GDS-capable
+# host-backed mount (see .buildkite/k3_tests/unit/run.sh); locally it's
+# unset and tempfile falls back to its default. Direct-I/O-backed paths are
+# required for GDS tests (cuFile err=5027 on overlayfs/tmpfs).
+_TEST_TMPDIR = os.environ.get("LMCACHE_TEST_TMPDIR") or None
 
 
 def get_expected_count(token_len, save_unfull_chunk, chunk_size):
@@ -57,7 +68,6 @@ def get_expected_count(token_len, save_unfull_chunk, chunk_size):
 )
 def test_paged_same_retrieve_store(save_unfull_chunk, autorelease_v1):
     device = "cuda"
-    fmt = "vllm"
     num_tokens = 2000
     num_blocks = 1000
     block_size = 16
@@ -95,7 +105,7 @@ def test_paged_same_retrieve_store(save_unfull_chunk, autorelease_v1):
         LMCacheEngineBuilder.get_or_create(
             "test",
             cfg,
-            dumb_metadata(fmt, kv_shape),
+            dumb_metadata(kv_shape),
             connector,
             mock_up_broadcast_fn,
             mock_up_broadcast_object_fn,
@@ -133,7 +143,6 @@ def test_paged_same_retrieve_store(save_unfull_chunk, autorelease_v1):
     check_paged_kv_cache_equal(retrieved_cache, kv_cache, slot_mapping[:expected_count])
 
 
-@pytest.mark.parametrize("fmt", ["vllm"])
 @pytest.mark.parametrize("chunk_size", [128, 256])
 @pytest.mark.parametrize("backend", ["cpu", "local_disk", "remote", "remote_cachegen"])
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
@@ -143,7 +152,7 @@ def test_paged_same_retrieve_store(save_unfull_chunk, autorelease_v1):
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_retrieve_prefix(
-    fmt, chunk_size, backend, save_unfull_chunk, lmserver_v1_process, autorelease_v1
+    chunk_size, backend, save_unfull_chunk, lmserver_v1_process, autorelease_v1
 ):
     url = None
     remote_serde = None
@@ -192,7 +201,7 @@ def test_paged_retrieve_prefix(
         LMCacheEngineBuilder.get_or_create(
             "test",
             cfg,
-            dumb_metadata(fmt, kv_shape),
+            dumb_metadata(kv_shape),
             connector,
             mock_up_broadcast_fn,
             mock_up_broadcast_object_fn,
@@ -252,7 +261,6 @@ def test_paged_retrieve_prefix(
         subprocess.run(shlex.split("rm -rf local/disk_test/local_disk/"))
 
 
-@pytest.mark.parametrize("fmt", ["vllm"])
 @pytest.mark.parametrize("chunk_size", [256])
 @pytest.mark.parametrize(
     "backend",
@@ -265,7 +273,7 @@ def test_paged_retrieve_prefix(
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_store_offset(
-    fmt, chunk_size, backend, save_unfull_chunk, lmserver_v1_process, autorelease_v1
+    chunk_size, backend, save_unfull_chunk, lmserver_v1_process, autorelease_v1
 ):
     url = None
     if backend == "remote":
@@ -302,7 +310,7 @@ def test_paged_store_offset(
         LMCacheEngineBuilder.get_or_create(
             "test",
             cfg,
-            dumb_metadata(fmt, kv_shape),
+            dumb_metadata(kv_shape),
             connector,
             mock_up_broadcast_fn,
             mock_up_broadcast_object_fn,
@@ -362,7 +370,6 @@ def test_paged_store_offset(
         subprocess.run(shlex.split("rm -rf local/disk_test/local_disk/"))
 
 
-@pytest.mark.parametrize("fmt", ["vllm"])
 @pytest.mark.parametrize("chunk_size", [128])  # , 256])
 @pytest.mark.parametrize(
     "backend",
@@ -376,9 +383,7 @@ def test_paged_store_offset(
     not torch.cuda.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
-def test_paged_mixed_retrieve(
-    fmt, chunk_size, backend, save_unfull_chunk, autorelease_v1
-):
+def test_paged_mixed_retrieve(chunk_size, backend, save_unfull_chunk, autorelease_v1):
     device = "cuda"
     num_tokens = 2000
     new_num_tokens = 1000
@@ -414,7 +419,7 @@ def test_paged_mixed_retrieve(
         LMCacheEngineBuilder.get_or_create(
             "test",
             cfg,
-            dumb_metadata(fmt, kv_shape),
+            dumb_metadata(kv_shape),
             connector,
             mock_up_broadcast_fn,
             mock_up_broadcast_object_fn,
@@ -522,13 +527,12 @@ def test_paged_mixed_retrieve(
         subprocess.run(shlex.split("rm -rf local/disk_test/local_disk/"))
 
 
-@pytest.mark.parametrize("fmt", ["vllm"])
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
-def test_paged_store_kv_tensors_mask(fmt, save_unfull_chunk, autorelease_v1):
+def test_paged_store_kv_tensors_mask(save_unfull_chunk, autorelease_v1):
     device = "cuda"
     num_tokens = 1000
     new_num_tokens = 2000
@@ -563,7 +567,7 @@ def test_paged_store_kv_tensors_mask(fmt, save_unfull_chunk, autorelease_v1):
         LMCacheEngineBuilder.get_or_create(
             "test",
             cfg,
-            dumb_metadata(fmt, kv_shape),
+            dumb_metadata(kv_shape),
             connector,
             mock_up_broadcast_fn,
             mock_up_broadcast_object_fn,
@@ -684,7 +688,6 @@ def test_paged_store_kv_tensors_mask(fmt, save_unfull_chunk, autorelease_v1):
         recover_engine_states(engine)
 
 
-@pytest.mark.parametrize("fmt", ["vllm"])
 @pytest.mark.parametrize("chunk_size", [128])
 @pytest.mark.parametrize(
     "backend",
@@ -707,7 +710,6 @@ def test_paged_store_kv_tensors_mask(fmt, save_unfull_chunk, autorelease_v1):
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_hierarchy_retrieve(
-    fmt,
     chunk_size,
     backend,
     retrieve_from,
@@ -757,7 +759,7 @@ def test_paged_hierarchy_retrieve(
         LMCacheEngineBuilder.get_or_create(
             "test",
             cfg,
-            dumb_metadata(fmt, kv_shape),
+            dumb_metadata(kv_shape),
             connector,
             mock_up_broadcast_fn,
             mock_up_broadcast_object_fn,
@@ -866,7 +868,6 @@ def test_paged_prefetch_retrieve(
     test_lookup_id = "test_lookup_id"
 
     chunk_size = 256
-    fmt = "vllm"
     kv_shape = (32, 2, chunk_size, 8, 128)
     connector = create_gpu_connector(1024, 32)
 
@@ -894,18 +895,19 @@ def test_paged_prefetch_retrieve(
         save_unfull_chunk=save_unfull_chunk,
     )
 
+    async_lookup_server = DummyLMCacheAsyncLookupServer()
     engine = autorelease_v1(
         LMCacheEngineBuilder.get_or_create(
             "test",
             cfg,
-            dumb_metadata(fmt, kv_shape),
+            dumb_metadata(kv_shape),
             connector,
             mock_up_broadcast_fn,
             mock_up_broadcast_object_fn,
-        )
+        ),
+        async_lookup_server=async_lookup_server,
     )
-    async_lookup_server = DummyLMCacheAsyncLookupServer()
-    engine.post_init(async_lookup_server=async_lookup_server)
+
     """ test store """
     t1 = time.perf_counter()
     engine.store(tokens, kvcaches=kv_cache, slot_mapping=slot_mapping)
@@ -977,7 +979,154 @@ def test_paged_prefetch_retrieve(
         subprocess.run(shlex.split("rm -rf local/disk_test/local_disk/"))
 
 
-@pytest.mark.parametrize("fmt", ["vllm"])
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
+)
+def test_async_lookup_and_prefetch_layerwise(autorelease_v1):
+    # Regression: before the fix, async_lookup_and_prefetch sent chunk-level
+    # CacheEngineKey objects into batched_async_contains, but store_layer
+    # populates hot_cache with per-layer LayerCacheEngineKey objects, so every
+    # lookup reported 0 hits. We stage hot_cache the way store_layer would and
+    # assert async_lookup_and_prefetch reports the full token count.
+    chunk_size = 256
+    num_layers = 4
+    num_chunks = 3
+    num_tokens = chunk_size * num_chunks
+    kv_shape = (num_layers, 2, chunk_size, 8, 128)
+    lookup_id = "layerwise-async-1"
+
+    captured: dict[str, int] = {}
+
+    class _RecordingAsyncLookupServer:
+        def send_response_to_scheduler(
+            self, lookup_id: str, retrieved_length: int
+        ) -> None:
+            captured[lookup_id] = retrieved_length
+
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=chunk_size,
+        backend="cpu",
+        enable_async_loading=True,
+    )
+    cfg.use_layerwise = True
+
+    connector = create_gpu_connector(1024, num_layers)
+    engine = autorelease_v1(
+        LMCacheEngineBuilder.get_or_create(
+            "test",
+            cfg,
+            dumb_metadata(kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
+        ),
+        async_lookup_server=_RecordingAsyncLookupServer(),
+    )
+
+    tokens = generate_tokens(num_tokens, "cuda")
+    chunk_keys = [
+        key for _, _, key in engine.token_database.process_tokens(tokens=tokens)
+    ]
+    assert len(chunk_keys) == num_chunks
+
+    # Populate LocalCPUBackend.hot_cache the way store_layer would: one entry
+    # per (chunk, layer) keyed by LayerCacheEngineKey.
+    cpu_backend = engine.storage_manager.storage_backends["LocalCPUBackend"]
+    for chunk_key in chunk_keys:
+        for layer_key in chunk_key.split_layers(num_layers):
+            cpu_backend.submit_put_task(layer_key, create_test_memory_obj())
+
+    engine.async_lookup_and_prefetch(lookup_id=lookup_id, tokens=tokens)
+
+    deadline = time.time() + 10
+    while (
+        engine.event_manager.get_event_status(EventType.LOADING, lookup_id)
+        != EventStatus.DONE
+    ):
+        if time.time() > deadline:
+            raise TimeoutError("layerwise async lookup did not finish in time")
+        time.sleep(0.01)
+
+    assert captured.get(lookup_id) == num_tokens, (
+        f"Expected retrieved_length={num_tokens}, got {captured.get(lookup_id)}"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
+)
+def test_async_lookup_and_prefetch_layerwise_partial_layer_missing(autorelease_v1):
+    # When a single per-layer key is missing for one chunk, that chunk must be
+    # rounded down to a miss (the `// keys_per_chunk` round-down path).
+    chunk_size = 256
+    num_layers = 4
+    num_chunks = 3
+    num_tokens = chunk_size * num_chunks
+    kv_shape = (num_layers, 2, chunk_size, 8, 128)
+    lookup_id = "layerwise-async-2"
+
+    captured: dict[str, int] = {}
+
+    class _RecordingAsyncLookupServer:
+        def send_response_to_scheduler(
+            self, lookup_id: str, retrieved_length: int
+        ) -> None:
+            captured[lookup_id] = retrieved_length
+
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=chunk_size,
+        backend="cpu",
+        enable_async_loading=True,
+    )
+    cfg.use_layerwise = True
+
+    connector = create_gpu_connector(1024, num_layers)
+    engine = autorelease_v1(
+        LMCacheEngineBuilder.get_or_create(
+            "test",
+            cfg,
+            dumb_metadata(kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
+        ),
+        async_lookup_server=_RecordingAsyncLookupServer(),
+    )
+
+    tokens = generate_tokens(num_tokens, "cuda")
+    chunk_keys = [
+        key for _, _, key in engine.token_database.process_tokens(tokens=tokens)
+    ]
+
+    # Stage chunks 0 and 1 fully; drop the last per-layer key of chunk 2.
+    cpu_backend = engine.storage_manager.storage_backends["LocalCPUBackend"]
+    for i, chunk_key in enumerate(chunk_keys):
+        per_layer_keys = chunk_key.split_layers(num_layers)
+        if i == len(chunk_keys) - 1:
+            per_layer_keys = per_layer_keys[:-1]
+        for layer_key in per_layer_keys:
+            cpu_backend.submit_put_task(layer_key, create_test_memory_obj())
+
+    engine.async_lookup_and_prefetch(lookup_id=lookup_id, tokens=tokens)
+
+    deadline = time.time() + 10
+    while (
+        engine.event_manager.get_event_status(EventType.LOADING, lookup_id)
+        != EventStatus.DONE
+    ):
+        if time.time() > deadline:
+            raise TimeoutError("layerwise async lookup did not finish in time")
+        time.sleep(0.01)
+
+    # First two chunks are complete; the partially-evicted third chunk is a
+    # miss, so the prefix-match retrieval pattern reports 2 chunks worth.
+    assert captured.get(lookup_id) == 2 * chunk_size, (
+        f"Expected retrieved_length={2 * chunk_size}, got {captured.get(lookup_id)}"
+    )
+
+
 @pytest.mark.parametrize("chunk_size", [256])
 @pytest.mark.parametrize(
     "backend",
@@ -997,7 +1146,7 @@ def test_paged_prefetch_retrieve(
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_mem_leak(
-    fmt, chunk_size, backend, save_unfull_chunk, lmserver_v1_process, autorelease_v1
+    chunk_size, backend, save_unfull_chunk, lmserver_v1_process, autorelease_v1
 ):
     url = None
     if "remote" in backend:
@@ -1029,7 +1178,7 @@ def test_paged_mem_leak(
         LMCacheEngineBuilder.get_or_create(
             "test",
             cfg,
-            dumb_metadata(fmt, kv_shape),
+            dumb_metadata(kv_shape),
             connector,
             mock_up_broadcast_fn,
             mock_up_broadcast_object_fn,
@@ -1077,7 +1226,6 @@ def test_paged_mem_leak(
         subprocess.run(shlex.split("rm -rf local/disk_test/local_disk/"))
 
 
-@pytest.mark.parametrize("fmt", ["vllm"])
 @pytest.mark.parametrize("chunk_size", [256])
 @pytest.mark.parametrize(
     "backend",
@@ -1093,7 +1241,7 @@ def test_paged_mem_leak(
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_retrieve_after_eviction(
-    fmt, chunk_size, backend, save_unfull_chunk, autorelease_v1
+    chunk_size, backend, save_unfull_chunk, autorelease_v1
 ):
     device = "cuda"
     # NOTE: The default backend cache size is 2 GB.
@@ -1128,7 +1276,7 @@ def test_paged_retrieve_after_eviction(
         LMCacheEngineBuilder.get_or_create(
             "test",
             cfg,
-            dumb_metadata(fmt, kv_shape),
+            dumb_metadata(kv_shape),
             connector,
             mock_up_broadcast_fn,
             mock_up_broadcast_object_fn,
@@ -1239,7 +1387,6 @@ def test_builder(autorelease_v1):
 )
 def test_force_store_wait(autorelease_v1):
     device = "cuda"
-    fmt = "vllm"
     num_tokens = 10000
     num_blocks = 5000
     block_size = 16
@@ -1266,9 +1413,8 @@ def test_force_store_wait(autorelease_v1):
         for _ in range(num_requests)
     ]
 
-    homedir = os.environ.get("HOME", "/tmp")
     with tempfile.TemporaryDirectory(
-        dir=homedir, ignore_cleanup_errors=True
+        dir=_TEST_TMPDIR, ignore_cleanup_errors=True
     ) as temp_dir:
         cfg = LMCacheEngineConfig.from_defaults(
             local_cpu=False,
@@ -1282,7 +1428,7 @@ def test_force_store_wait(autorelease_v1):
             LMCacheEngineBuilder.get_or_create(
                 "test",
                 cfg,
-                dumb_metadata(fmt, kv_shape),
+                dumb_metadata(kv_shape),
                 connector,
                 mock_up_broadcast_fn,
                 mock_up_broadcast_object_fn,
@@ -1294,7 +1440,7 @@ def test_force_store_wait(autorelease_v1):
             engine.store(t, kvcaches=kv_cache, slot_mapping=s)
 
         # Sleep 10 seconds for the last request
-        time.sleep(10)
+        time.sleep(20)
 
         # No KV cache should be skipped
         # With default save_unfull_chunk=False, we expect chunk-aligned count
@@ -1418,6 +1564,11 @@ def test_builder_destroy_multiple_instances(autorelease_v1):
     not torch.cuda.is_available(),
     reason="Requires CUDA for test_multi_device_backends",
 )
+@pytest.mark.skipif(
+    not has_cufile(),
+    reason="Requires NVIDIA cuFile (libcufile.so). "
+    "Skipping on systems without GDS/cuFile (e.g., AMD ROCm).",
+)
 def test_multi_device_backends(save_unfull_chunk, autorelease_v1):
     """Test running GPU-related backend with local CPU backends
     together
@@ -1452,16 +1603,15 @@ def test_multi_device_backends(save_unfull_chunk, autorelease_v1):
     with pytest.raises(AssertionError):
         check_paged_kv_cache_equal(retrieved_cache, kv_cache, slot_mapping)
 
-    homedir = os.environ.get("HOME", "/tmp")
     with tempfile.TemporaryDirectory(
-        dir=homedir, ignore_cleanup_errors=True
+        dir=_TEST_TMPDIR, ignore_cleanup_errors=True
     ) as temp_dir:
         cfg = LMCacheEngineConfig.from_dict(
             {
                 "local_cpu": True,
                 "max_local_cpu_size": 5,
                 "gds_path": temp_dir,
-                "cufile_buffer_size": 1024,
+                "gds_buffer_size": 1024,
                 "save_unfull_chunk": save_unfull_chunk,
                 "extra_config": {
                     "use_direct_io": True,
@@ -1511,3 +1661,397 @@ def test_multi_device_backends(save_unfull_chunk, autorelease_v1):
         )
 
         LMCacheEngineBuilder.destroy("engine")
+
+
+def _make_key(chunk_hash: int) -> CacheEngineKey:
+    """Create a CacheEngineKey for testing."""
+    return CacheEngineKey("test", 1, 0, chunk_hash, torch.bfloat16)
+
+
+def _make_mock_memory_obj(size: int = 1024) -> MagicMock:
+    """Create a mock MemoryObj that tracks ref_count_down calls."""
+    mock = MagicMock()
+    mock.get_size.return_value = size
+    return mock
+
+
+def _make_mock_engine(
+    process_tokens_results: list,
+    block_mapping: dict,
+    batched_get_side_effect: list,
+) -> MagicMock:
+    """Create a mock engine with the attributes needed by
+    _process_tokens_internal.
+
+    Args:
+        process_tokens_results: list of (start, end, key) tuples that
+            token_database.process_tokens will yield.
+        block_mapping: dict returned by storage_manager.get_block_mapping.
+        batched_get_side_effect: list of return values for successive
+            storage_manager.batched_get calls (one per location).
+
+    Returns:
+        A MagicMock configured as a minimal LMCacheEngine.
+    """
+    engine = MagicMock()
+    engine.token_database.process_tokens.return_value = process_tokens_results
+    engine.storage_manager.get_block_mapping.return_value = block_mapping
+    engine.storage_manager.batched_get.side_effect = batched_get_side_effect
+    engine.lookup_pins = {}
+    return engine
+
+
+def test_process_tokens_single_location_boundary_failure():
+    """The block whose end equals last_failed_block_start covers
+    [start, last_failed_block_start) — entirely before the gap — and
+    must be kept."""
+    k0, k1 = _make_key(0), _make_key(1)
+    mem0 = _make_mock_memory_obj()
+
+    engine = _make_mock_engine(
+        process_tokens_results=[(0, 10, k0), (10, 20, k1)],
+        block_mapping=OrderedDict(
+            [
+                ("LocationA", [(k0, 0, 10), (k1, 10, 20)]),
+            ]
+        ),
+        batched_get_side_effect=[[mem0, None]],
+    )
+
+    ret_mask = torch.zeros(20, dtype=torch.bool)
+    chunks, tot_kv_size = LMCacheEngine._process_tokens_internal(
+        engine, torch.zeros(20, dtype=torch.long), None, ret_mask
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0][0] == k0
+    assert chunks[0][1] is mem0
+    assert tot_kv_size == 1024
+    assert ret_mask[:10].all()
+    assert not ret_mask[10:].any()
+    mem0.ref_count_down.assert_not_called()
+
+
+def test_process_tokens_early_failure_truncates_later_location():
+    """When an early location fails, blocks successfully retrieved from
+    a later location (covering higher positions) must be discarded and
+    freed because they are past the gap."""
+    k0, k1 = _make_key(0), _make_key(1)
+    k2, k3 = _make_key(2), _make_key(3)
+    mem0 = _make_mock_memory_obj()
+    mem2 = _make_mock_memory_obj()
+    mem3 = _make_mock_memory_obj()
+
+    engine = _make_mock_engine(
+        process_tokens_results=[
+            (0, 10, k0),
+            (10, 20, k1),
+            (20, 30, k2),
+            (30, 40, k3),
+        ],
+        block_mapping=OrderedDict(
+            [
+                ("LocationA", [(k0, 0, 10), (k1, 10, 20)]),
+                ("LocationB", [(k2, 20, 30), (k3, 30, 40)]),
+            ]
+        ),
+        batched_get_side_effect=[
+            [mem0, None],
+            [mem2, mem3],
+        ],
+    )
+
+    ret_mask = torch.zeros(40, dtype=torch.bool)
+    chunks, tot_kv_size = LMCacheEngine._process_tokens_internal(
+        engine, torch.zeros(40, dtype=torch.long), None, ret_mask
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0][0] == k0
+    assert tot_kv_size == 1024
+    assert ret_mask[:10].all()
+    assert not ret_mask[10:].any()
+    mem0.ref_count_down.assert_not_called()
+    mem2.ref_count_down.assert_called_once()
+    mem3.ref_count_down.assert_called_once()
+
+
+def test_process_tokens_multi_location_both_fail_takes_min():
+    """When failures occur in multiple locations, the earliest failure
+    start (MIN) should be used so that everything after the first gap
+    is discarded."""
+    k0, k1 = _make_key(0), _make_key(1)
+    k2, k3 = _make_key(2), _make_key(3)
+    mem0 = _make_mock_memory_obj()
+    mem2 = _make_mock_memory_obj()
+
+    engine = _make_mock_engine(
+        process_tokens_results=[
+            (0, 10, k0),
+            (10, 20, k1),
+            (20, 30, k2),
+            (30, 40, k3),
+        ],
+        block_mapping=OrderedDict(
+            [
+                ("LocationA", [(k0, 0, 10), (k1, 10, 20)]),
+                ("LocationB", [(k2, 20, 30), (k3, 30, 40)]),
+            ]
+        ),
+        batched_get_side_effect=[
+            [mem0, None],
+            [mem2, None],
+        ],
+    )
+
+    ret_mask = torch.zeros(40, dtype=torch.bool)
+    chunks, tot_kv_size = LMCacheEngine._process_tokens_internal(
+        engine, torch.zeros(40, dtype=torch.long), None, ret_mask
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0][0] == k0
+    assert tot_kv_size == 1024
+    assert ret_mask[:10].all()
+    assert not ret_mask[10:].any()
+    mem0.ref_count_down.assert_not_called()
+    mem2.ref_count_down.assert_called_once()
+
+
+def test_process_tokens_no_failure():
+    """When all blocks are retrieved successfully, every chunk should
+    be returned and no ref_count_down should be called."""
+    k0, k1 = _make_key(0), _make_key(1)
+    mem0 = _make_mock_memory_obj()
+    mem1 = _make_mock_memory_obj()
+
+    engine = _make_mock_engine(
+        process_tokens_results=[(0, 10, k0), (10, 20, k1)],
+        block_mapping=OrderedDict(
+            [
+                ("LocationA", [(k0, 0, 10), (k1, 10, 20)]),
+            ]
+        ),
+        batched_get_side_effect=[[mem0, mem1]],
+    )
+
+    ret_mask = torch.zeros(20, dtype=torch.bool)
+    chunks, tot_kv_size = LMCacheEngine._process_tokens_internal(
+        engine, torch.zeros(20, dtype=torch.long), None, ret_mask
+    )
+
+    assert len(chunks) == 2
+    assert tot_kv_size == 2048
+    assert ret_mask[:20].all()
+    mem0.ref_count_down.assert_not_called()
+    mem1.ref_count_down.assert_not_called()
+
+
+def test_process_tokens_unused_keys_no_double_free():
+    """A key returned non-None by batched_get but coming after a None
+    (unused) should be freed exactly once in the per-location cleanup
+    and never again in post-processing."""
+    k0, k1, k2 = _make_key(0), _make_key(1), _make_key(2)
+    mem0 = _make_mock_memory_obj()
+    mem2 = _make_mock_memory_obj()
+
+    engine = _make_mock_engine(
+        process_tokens_results=[(0, 10, k0), (10, 20, k1), (20, 30, k2)],
+        block_mapping=OrderedDict(
+            [
+                ("LocationA", [(k0, 0, 10), (k1, 10, 20), (k2, 20, 30)]),
+            ]
+        ),
+        batched_get_side_effect=[[mem0, None, mem2]],
+    )
+
+    ret_mask = torch.zeros(30, dtype=torch.bool)
+    chunks, tot_kv_size = LMCacheEngine._process_tokens_internal(
+        engine, torch.zeros(30, dtype=torch.long), None, ret_mask
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0][0] == k0
+    assert tot_kv_size == 1024
+    assert ret_mask[:10].all()
+    assert not ret_mask[10:].any()
+    mem0.ref_count_down.assert_not_called()
+    mem2.ref_count_down.assert_called_once()
+
+
+def test_process_tokens_first_block_fails():
+    """When the very first block fails, no chunks should be returned
+    and ret_mask should be all False."""
+    k0, k1 = _make_key(0), _make_key(1)
+    mem1 = _make_mock_memory_obj()
+
+    engine = _make_mock_engine(
+        process_tokens_results=[(0, 10, k0), (10, 20, k1)],
+        block_mapping=OrderedDict(
+            [
+                ("LocationA", [(k0, 0, 10), (k1, 10, 20)]),
+            ]
+        ),
+        batched_get_side_effect=[[None, mem1]],
+    )
+
+    ret_mask = torch.zeros(20, dtype=torch.bool)
+    chunks, tot_kv_size = LMCacheEngine._process_tokens_internal(
+        engine, torch.zeros(20, dtype=torch.long), None, ret_mask
+    )
+
+    assert len(chunks) == 0
+    assert tot_kv_size == 0
+    assert not ret_mask.any()
+    mem1.ref_count_down.assert_called_once()
+
+
+def test_compress_decompress_unpin_not_pinned() -> None:
+    """Verify that compress and decompress check is_pinned before calling unpin()
+
+    This prevents negative pin counts and double unpin warnings on backends like
+    Remote/S3.
+    """
+    # Create mock memory objects
+    mock_mem_obj = MagicMock()
+    mock_mem_obj.is_pinned = False  # Not pinned (e.g. from Remote/S3 backend)
+
+    mock_compressed_mem_obj = MagicMock()
+    mock_compressed_mem_obj.is_pinned = False  # Not pinned
+
+    # Mock serializer and deserializer
+    mock_serializer = MagicMock()
+    mock_serializer.serialize.return_value = mock_compressed_mem_obj
+    mock_deserializer = MagicMock()
+    mock_deserializer.deserialize.return_value = mock_mem_obj
+
+    # Create a mock engine
+    engine = MagicMock(spec=LMCacheEngine)
+    engine.metadata = MagicMock()
+    engine.config = MagicMock()
+    engine.lookup_pins = {"event_123": {"remote": ["key1"]}}
+
+    # Mock engine.lookup to return number of tokens (non-zero)
+    engine.lookup.return_value = 100
+
+    # Mock storage_manager methods
+    engine.storage_manager = MagicMock()
+    # For compress: batched_get returns mock_mem_obj
+    engine.storage_manager.batched_get.return_value = [mock_mem_obj]
+
+    with patch(
+        "lmcache.v1.storage_backend.naive_serde.CreateSerde",
+        return_value=(mock_serializer, mock_deserializer),
+    ):
+        # Call compress on the engine
+        res = LMCacheEngine.compress(
+            engine,
+            tokens=[1, 2, 3],
+            method="cachegen",
+            location="remote",
+            event_id="event_123",
+        )
+
+        assert res == 100
+        # Verify that serialize was called
+        mock_serializer.serialize.assert_called_once_with(mock_mem_obj)
+        # Verify that unpin was NOT called since is_pinned = False
+        mock_mem_obj.unpin.assert_not_called()
+
+        # Verify batched_remove and batched_put were called on storage_manager
+        engine.storage_manager.batched_remove.assert_called_once_with(
+            ["key1"], locations=["remote"]
+        )
+        engine.storage_manager.batched_put.assert_called_once_with(
+            keys=["key1"],
+            memory_objs=[mock_compressed_mem_obj],
+            location="remote",
+        )
+
+    # Reset storage_manager mock
+    engine.storage_manager.reset_mock()
+    # For decompress: batched_get returns mock_compressed_mem_obj
+    engine.storage_manager.batched_get.return_value = [mock_compressed_mem_obj]
+
+    with patch(
+        "lmcache.v1.storage_backend.naive_serde.CreateSerde",
+        return_value=(mock_serializer, mock_deserializer),
+    ):
+        res_decomp = LMCacheEngine.decompress(
+            engine,
+            tokens=[1, 2, 3],
+            method="cachegen",
+            location="remote",
+            event_id="event_123",
+        )
+
+        assert res_decomp == 100
+        # Verify that deserialize was called
+        mock_deserializer.deserialize.assert_called_once_with(mock_compressed_mem_obj)
+        # Verify that unpin was NOT called since is_pinned = False
+        mock_compressed_mem_obj.unpin.assert_not_called()
+
+        # Verify batched_remove and batched_put were called on storage_manager
+        engine.storage_manager.batched_remove.assert_called_once_with(
+            ["key1"], locations=["remote"]
+        )
+        engine.storage_manager.batched_put.assert_called_once_with(
+            keys=["key1"],
+            memory_objs=[mock_mem_obj],
+            location="remote",
+        )
+
+
+def test_compress_decompress_unpin_when_pinned() -> None:
+    """Verify that compress and decompress call unpin() if is_pinned is True"""
+    # Create mock memory objects
+    mock_mem_obj = MagicMock()
+    mock_mem_obj.is_pinned = True
+
+    mock_compressed_mem_obj = MagicMock()
+    mock_compressed_mem_obj.is_pinned = True
+
+    # Mock serializer and deserializer
+    mock_serializer = MagicMock()
+    mock_serializer.serialize.return_value = mock_compressed_mem_obj
+    mock_deserializer = MagicMock()
+    mock_deserializer.deserialize.return_value = mock_mem_obj
+
+    # Create a mock engine
+    engine = MagicMock(spec=LMCacheEngine)
+    engine.metadata = MagicMock()
+    engine.config = MagicMock()
+    engine.lookup_pins = {"event_123": {"local_cpu": ["key1"]}}
+    engine.lookup.return_value = 100
+    engine.storage_manager = MagicMock()
+
+    # Test compress
+    engine.storage_manager.batched_get.return_value = [mock_mem_obj]
+    with patch(
+        "lmcache.v1.storage_backend.naive_serde.CreateSerde",
+        return_value=(mock_serializer, mock_deserializer),
+    ):
+        LMCacheEngine.compress(
+            engine,
+            tokens=[1, 2, 3],
+            method="cachegen",
+            location="local_cpu",
+            event_id="event_123",
+        )
+        mock_mem_obj.unpin.assert_called_once()
+
+    # Test decompress
+    engine.storage_manager.reset_mock()
+    engine.storage_manager.batched_get.return_value = [mock_compressed_mem_obj]
+    with patch(
+        "lmcache.v1.storage_backend.naive_serde.CreateSerde",
+        return_value=(mock_serializer, mock_deserializer),
+    ):
+        LMCacheEngine.decompress(
+            engine,
+            tokens=[1, 2, 3],
+            method="cachegen",
+            location="local_cpu",
+            event_id="event_123",
+        )
+        mock_compressed_mem_obj.unpin.assert_called_once()

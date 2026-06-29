@@ -17,23 +17,40 @@ from .api_registry import APIRegistry
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
+    from lmcache.v1.manager import LMCacheManager
 
 logger = init_logger(__name__)
 
-app = FastAPI()
 
-# Automatically register common, vllm, and controller APIs
-registry = APIRegistry(app)
-registry.register_all_apis(categories=["common", "vllm", "controller"])
+def _build_app() -> FastAPI:
+    """Create a fresh FastAPI app with all internal API routes registered."""
+    new_app = FastAPI()
+    APIRegistry(new_app).register_all_apis()
+    return new_app
+
+
+# Module-level app kept for backward compatibility with existing tests that
+# import `app` directly. Production code no longer relies on this shared
+# singleton; each InternalAPIServer owns its own FastAPI app so that
+# multiple instances in the same process (e.g. scheduler + worker in TP=1
+# non-MP mode) do not overwrite each other's app.state.lmcache_adapter.
+app = _build_app()
 
 
 class InternalAPIServer:
-    def __init__(self, lmcache_adapter: "LMCacheConnectorV1Impl"):
-        config = lmcache_adapter.config
-        lmcache_engine = lmcache_adapter.lmcache_engine
-        # 0 for scheduler, 1 for worker 0, 2 for worker 1, ...
-        port_offset = 0 if not lmcache_engine else 1 + lmcache_engine.metadata.worker_id
+    def __init__(self, lmcache_manager: "LMCacheManager"):
+        lmcache_engine = lmcache_manager.lmcache_engine
+
+        # Check if lmcache_engine is None and handle accordingly
+        if lmcache_engine is None:
+            # Use manager's config directly when engine is not available
+            config = lmcache_manager.config
+            port_offset = 0  # Default for scheduler mode
+        else:
+            config = lmcache_engine.config
+            # 0 for scheduler, 1 for worker 0, 2 for worker 1, ...
+            port_offset = 1 + lmcache_engine.metadata.worker_id
+
         self.port = config.internal_api_server_port_start + port_offset
         self.socket_path_prefix = config.internal_api_server_socket_path_prefix
         self.socket_path = (
@@ -48,16 +65,21 @@ class InternalAPIServer:
             include_index_list and port_offset not in include_index_list
         ):
             logger.info(
-                f"Internal API server disabled. internal_api_server_enabled="
-                f"{config.internal_api_server_enabled}, port_offset={port_offset}, "
-                f"port={self.port}, socket_path={self.socket_path}, "
-                f"include_index_list={include_index_list}"
+                "Internal API server disabled. internal_api_server_enabled=%s, "
+                "port_offset=%s, port=%s, socket_path=%s, include_index_list=%s",
+                config.internal_api_server_enabled,
+                port_offset,
+                self.port,
+                self.socket_path,
+                include_index_list,
             )
             self.enable = False
             return
 
+        self.app = _build_app()
+
         uvicorn_config = {
-            "app": app,
+            "app": self.app,
             "host": config.internal_api_server_host,
             "loop": "uvloop",
             "http": "httptools",
@@ -71,7 +93,7 @@ class InternalAPIServer:
 
         if self.socket_path:
             self.server_log_info = f"socket {self.socket_path}"
-            logger.info(f"Init internal API server on {self.server_log_info}")
+            logger.info("Init internal API server on %s", self.server_log_info)
             uvicorn_config["uds"] = self.socket_path
             # Ensure socket directory exists
             os.makedirs(os.path.dirname(self.socket_path), exist_ok=True)
@@ -80,22 +102,27 @@ class InternalAPIServer:
                 os.unlink(self.socket_path)
         else:
             self.server_log_info = f"port {self.port}"
-            logger.info(f"Init internal API server on {self.server_log_info}")
+            logger.info("Init internal API server on %s", self.server_log_info)
             uvicorn_config["port"] = self.port
 
         self.server = uvicorn.Server(uvicorn.Config(**uvicorn_config))
-        app.state.lmcache_adapter = lmcache_adapter
+        self.app.state.lmcache_adapter = lmcache_manager
 
     async def run(self):
-        logger.info(f"Running LMCache internal API server on {self.server_log_info}")
+        logger.info("Running LMCache internal API server on %s", self.server_log_info)
         if self.server:
             await self.server.serve()
 
     def start(self):
         if not self.enable:
             return
-        logger.info(f"Starting LMCache internal API server on {self.server_log_info}")
-        threading.Thread(target=asyncio.run, args=(self.run(),), daemon=True).start()
+        logger.info("Starting LMCache internal API server on %s", self.server_log_info)
+        threading.Thread(
+            target=asyncio.run,
+            args=(self.run(),),
+            daemon=True,
+            name="api-server-thread",
+        ).start()
 
     def stop(self):
         if not self.enable:

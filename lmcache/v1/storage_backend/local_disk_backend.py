@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
 import os
@@ -11,13 +12,14 @@ import time
 import torch
 
 # First Party
-from lmcache.config import LMCacheEngineMetadata
+from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
@@ -25,6 +27,7 @@ from lmcache.v1.storage_backend.job_executor.pq_executor import (
     AsyncPQThreadPoolExecutor,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.path_sharder import PathSharder
 
 if TYPE_CHECKING:
     # First Party
@@ -100,11 +103,11 @@ class LocalDiskBackend(StorageBackendInterface):
         config: LMCacheEngineConfig,
         loop: asyncio.AbstractEventLoop,
         local_cpu_backend: LocalCPUBackend,
-        dst_device: str = "cuda",
+        dst_device: str = torch_device_type,
         lmcache_worker: Optional["LMCacheWorker"] = None,
-        metadata: Optional[LMCacheEngineMetadata] = None,
+        metadata: Optional[LMCacheMetadata] = None,
     ):
-        if torch.cuda.is_available():
+        if torch_dev.is_available():
             super().__init__(dst_device)
         else:
             super().__init__("cpu")
@@ -119,10 +122,21 @@ class LocalDiskBackend(StorageBackendInterface):
         self.disk_lock = threading.Lock()
 
         assert config.local_disk is not None
-        self.path: str = config.local_disk
-        if not os.path.exists(self.path):
-            os.makedirs(self.path)
-            logger.info(f"Created local disk cache directory: {self.path}")
+
+        sharder = PathSharder(
+            raw_csv=config.local_disk,
+            strategy=config.local_disk_path_sharding,
+            dst_device=dst_device,
+            create_dirs=True,
+        )
+        self.path: str = sharder.selected
+
+        logger.info(
+            "Local disk cache path: %s (device %s, %d path(s) configured)",
+            self.path,
+            dst_device,
+            len(sharder.all_paths),
+        )
 
         self.loop = loop
 
@@ -168,7 +182,7 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             logger.warning("Controller message sender is not initialized")
 
-    def __str__(self):
+    def __str__(self) -> str:
         return "LocalDiskBackend"
 
     def _key_to_path(
@@ -224,31 +238,27 @@ class LocalDiskBackend(StorageBackendInterface):
         key: CacheEngineKey,
         force: bool = True,
     ) -> bool:
-        if force:
-            self.disk_lock.acquire()
+        lock_context = self.disk_lock if force else nullcontext()
+        with lock_context:
+            if not (meta := self.dict.pop(key, None)):
+                return False
 
-        if not (meta := self.dict.pop(key, None)):
+            path = meta.path
+            size = meta.size
+            self.usage -= size
+            self.stats_monitor.update_local_storage_usage(self.usage)
+
+            # NOTE: The following code will cause deadlock
+            # res = asyncio.run_coroutine_threadsafe(
+            #     self.disk_worker.submit_task("delete", os.remove, path),
+            #     self.loop,
+            # )
+            # res.result()
+
+            os.remove(path)
+
             if force:
-                self.disk_lock.release()
-            return False
-
-        path = meta.path
-        size = meta.size
-        self.usage -= size
-        self.stats_monitor.update_local_storage_usage(self.usage)
-
-        # NOTE: The following code will cause deadlock
-        # res = asyncio.run_coroutine_threadsafe(
-        #     self.disk_worker.submit_task("delete", os.remove, path),
-        #     self.loop,
-        # )
-        # res.result()
-
-        os.remove(path)
-
-        if force:
-            self.cache_policy.update_on_force_evict(key)
-            self.disk_lock.release()
+                self.cache_policy.update_on_force_evict(key)
 
         # Push kv evict msg with batching
         if self.batched_msg_sender is not None:
@@ -292,7 +302,17 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ):
+        """
+        Submit a single put task to store KV cache to disk asynchronously.
+
+        :param key: The cache key for this KV chunk.
+        :param memory_obj: The memory object containing the KV data.
+        :param on_complete_callback: Optional callback invoked once per key
+            after the disk write completes. Callback exceptions are caught
+            and logged.
+        """
         assert memory_obj.tensor is not None
 
         # skip repeated save
@@ -326,11 +346,11 @@ class LocalDiskBackend(StorageBackendInterface):
                 all_evict_keys.extend(evict_keys)
             if evict_success:
                 self.current_cache_size += required_size
+                self.cache_policy.update_on_put(key)
 
         if not evict_success:
             return None
 
-        self.cache_policy.update_on_put(key)
         memory_obj.ref_count_up()
 
         asyncio.run_coroutine_threadsafe(
@@ -339,6 +359,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.async_save_bytes_to_disk,
                 key=key,
                 memory_obj=memory_obj,
+                on_complete_callback=on_complete_callback,
             ),
             self.loop,
         )
@@ -349,37 +370,66 @@ class LocalDiskBackend(StorageBackendInterface):
         keys: Sequence[CacheEngineKey],
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
+        """
+        Submit batched put tasks to store KV caches to disk asynchronously.
+
+        :param keys: The cache keys for the KV chunks.
+        :param memory_objs: The memory objects containing the KV data.
+        :param transfer_spec: Optional transfer specification (unused).
+        :param on_complete_callback: Optional callback invoked once per key
+            after that key's disk write completes (not once per batch).
+            Callback exceptions are caught and logged.
+        """
         for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(key, memory_obj)
+            self.submit_put_task(
+                key, memory_obj, on_complete_callback=on_complete_callback
+            )
 
     def get_blocking(
         self,
         key: CacheEngineKey,
     ) -> Optional[MemoryObj]:
         """
-        Blocking get function.
+        Load a cached KV chunk from disk synchronously.
+
+        The cache policy is updated only after a successful load so that a
+        failed load (``load_bytes_from_disk`` returning ``None``) does not
+        record a phantom cache hit and skew future eviction decisions.
+
+        :param key: The cache key identifying the KV chunk.
+        :returns: A ``MemoryObj`` containing the loaded KV data, or ``None``
+            if the key is not present or the load fails.
         """
-        self.disk_lock.acquire()
-        if key not in self.dict:
-            self.disk_lock.release()
-            return None
+        with self.disk_lock:
+            if key not in self.dict:
+                return None
 
-        # Update cache recency
-        self.cache_policy.update_on_hit(key, self.dict)
+            disk_meta = self.dict[key]
+            path = disk_meta.path
+            dtype = disk_meta.dtype
+            shape = disk_meta.shape
+            fmt = disk_meta.fmt
+            assert dtype is not None
+            assert shape is not None
 
-        disk_meta = self.dict[key]
-        path = disk_meta.path
-        dtype = disk_meta.dtype
-        shape = disk_meta.shape
-        fmt = disk_meta.fmt
-        assert dtype is not None
-        assert shape is not None
-
-        self.disk_lock.release()
+        # Load is performed outside the lock: it can block for a non-trivial
+        # amount of time (CPU staging pool allocation + memcpy from disk) and
+        # must not hold disk_lock while waiting, or concurrent insert/evict
+        # operations would deadlock.
         memory_obj = self.load_bytes_from_disk(
             key, path, dtype=dtype, shape=shape, fmt=fmt
         )
+
+        if memory_obj is not None:
+            # Re-acquire the lock to update the eviction policy.  The key
+            # membership check guards against the entry being evicted between
+            # the two lock regions — in that case the policy state is already
+            # consistent and no update is needed.
+            with self.disk_lock:
+                if key in self.dict:
+                    self.cache_policy.update_on_hit(key, self.dict)
 
         return memory_obj
 
@@ -405,15 +455,24 @@ class LocalDiskBackend(StorageBackendInterface):
             assert dtype is not None
             assert shape is not None
 
+            # busy_loop=False prevents spinning on the event loop thread;
+            # if staging memory is exhausted the caller will get a logged
+            # error rather than a silent deadlock.
             memory_obj = self.local_cpu_backend.allocate(
                 shape,
                 dtype,
                 fmt,
+                busy_loop=False,
             )
 
-            assert memory_obj is not None, (
-                "Memory allocation failed during async disk load."
-            )
+            if memory_obj is None:
+                logger.error(
+                    "Memory allocation failed during async disk load for key %s. "
+                    "CPU staging pool may be exhausted (unpin() not called after "
+                    "a previous retrieve). Returning partial results.",
+                    key,
+                )
+                return mem_objs
 
             self.dict[key].pin()
 
@@ -423,7 +482,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
             self.disk_lock.release()
             logger.debug(f"Prefetching {key} from disk.")
-
+            memory_obj.pin()
             mem_objs.append(memory_obj)
             paths.append(path)
 
@@ -458,9 +517,14 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
         """
         Convert KV to bytes and async store bytes to disk.
+
+        :param on_complete_callback: Optional callback invoked after the disk
+            write completes for this key. Callback exceptions are caught and
+            logged.
         """
         kv_chunk = memory_obj.tensor
         assert kv_chunk is not None
@@ -491,6 +555,14 @@ class LocalDiskBackend(StorageBackendInterface):
 
         self.disk_worker.remove_put_task(key)
 
+        # Call the completion callback if provided
+        if on_complete_callback is not None:
+            try:
+                on_complete_callback(key)
+            except Exception as e:
+                logger.warning(f"on_complete_callback failed for key {key}: {e}")
+
+    @_lmcache_nvtx_annotate
     def batched_async_load_bytes_from_disk(
         self,
         paths: list[str],
@@ -513,9 +585,8 @@ class LocalDiskBackend(StorageBackendInterface):
             cached_positions = self.dict[key].cached_positions
             mem_obj.metadata.cached_positions = cached_positions
 
-            self.disk_lock.acquire()
-            self.dict[key].unpin()
-            self.disk_lock.release()
+            with self.disk_lock:
+                self.dict[key].unpin()
 
         return memory_objs
 
@@ -560,6 +631,7 @@ class LocalDiskBackend(StorageBackendInterface):
             f"Bandwidth: {size / disk_write_time / 1e6:.2f} MB/s"
         )
 
+    @_lmcache_nvtx_annotate
     def read_file(self, key, buffer, path):
         start_time = time.time()
         size = len(buffer)
@@ -590,7 +662,7 @@ class LocalDiskBackend(StorageBackendInterface):
             f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
         )
 
-    def get_allocator_backend(self):
+    def get_allocator_backend(self) -> LocalCPUBackend:
         return self.local_cpu_backend
 
     def close(self) -> None:

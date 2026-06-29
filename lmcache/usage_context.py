@@ -18,9 +18,11 @@ import requests
 import torch
 
 # First Party
-from lmcache.config import LMCacheEngineConfig, LMCacheEngineMetadata
+from lmcache import torch_dev, torch_device_type
 from lmcache.connections import global_http_connection
 from lmcache.logging import init_logger
+from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.metadata import LMCacheMetadata
 
 if TYPE_CHECKING:
     # First Party
@@ -66,21 +68,20 @@ class EnvMessage:
 
 
 class EngineMessage:
-    def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheEngineMetadata):
+    def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheMetadata):
         self.chunksize = config.chunk_size
-        self.local_device = config.local_device
-        self.max_local_cache_size = config.max_local_cache_size
+        self.local_device = "cpu" if config.local_cpu else torch_device_type
+        self.max_local_cache_size = int(config.max_local_cpu_size)
         self.remote_url = config.remote_url
         self.remote_serde = config.remote_serde
-        self.pipelined_backend = config.pipelined_backend
+        self.pipelined_backend = False
         self.save_decode_cache = config.save_decode_cache
         self.enable_blending = config.enable_blending
-        self.blend_recompute_ratio = config.blend_recompute_ratio
+        self.blend_recompute_ratio = 0.15
         self.blend_min_tokens = config.blend_min_tokens
         self.model_name = metadata.model_name
         self.world_size = metadata.world_size
         self.worker_id = metadata.worker_id
-        self.fmt = metadata.fmt
         self.kv_dtype = metadata.kv_dtype
         self.kv_shape = metadata.kv_shape
 
@@ -105,7 +106,7 @@ class UsageContext:
         self,
         server_url: str,
         config: LMCacheEngineConfig,
-        metadata: LMCacheEngineMetadata,
+        metadata: LMCacheMetadata,
         local_log: Optional[str] = None,
     ):
         self.server_url = server_url
@@ -242,14 +243,9 @@ class UsageContext:
         return num_cpu, cpu_type, cpu_family_model_stepping
 
     def _get_gpu_info(self):
-        if torch.cuda.is_available():
-            device_property = torch.cuda.get_device_properties(0)
-            gpu_count = torch.cuda.device_count()
-            gpu_type = device_property.name
-            gpu_memory_per_device = device_property.total_memory
-        elif torch.xpu.is_available():
-            device_property = torch.xpu.get_device_properties(0)
-            gpu_count = torch.xpu.device_count()
+        if torch_dev.is_available():
+            device_property = torch_dev.get_device_properties(0)
+            gpu_count = torch_dev.device_count()
             gpu_type = device_property.name
             gpu_memory_per_device = device_property.total_memory
         else:
@@ -285,7 +281,7 @@ class UsageContext:
 class ContinuousUsageContext:
     _instance = None
 
-    def __init__(self, metadata: LMCacheEngineMetadata):
+    def __init__(self, metadata: LMCacheMetadata):
         self.cache_lifespan_buckets = [
             0,
             1,
@@ -303,7 +299,7 @@ class ContinuousUsageContext:
             2500,
             5000,
         ]
-        self.metadata: LMCacheEngineMetadata = metadata
+        self.metadata: LMCacheMetadata = metadata
         self.cache_usage_url: str = urljoin(
             os.getenv("LMCACHE_USAGE_TRACK_URL", "http://stats.lmcache.ai:8080"),
             "cache-usage",
@@ -328,7 +324,7 @@ class ContinuousUsageContext:
         self.cache_lifespan_data: List[float] = []
 
     @staticmethod
-    def GetOrCreate(metadata: LMCacheEngineMetadata) -> "ContinuousUsageContext":
+    def GetOrCreate(metadata: LMCacheMetadata) -> "ContinuousUsageContext":
         if ContinuousUsageContext._instance is None:
             ContinuousUsageContext._instance = ContinuousUsageContext(metadata)
         if ContinuousUsageContext._instance.metadata != metadata:
@@ -358,7 +354,7 @@ class ContinuousUsageContext:
             self.interval_num_hit_tokens = 0
             self.interval_num_stored_tokens = 0
         except Exception as e:
-            logger.debug(f"Unable to send lmcache caching usage message: {e}")
+            logger.debug("Unable to send lmcache caching usage message: %s", e)
         try:
             histogram_data = self.list_to_histogram(
                 self.cache_lifespan_data, self.cache_lifespan_buckets
@@ -371,7 +367,7 @@ class ContinuousUsageContext:
                 logger.debug("caching lifespan message sent.")
             self.cache_lifespan_data = []
         except Exception as e:
-            logger.debug(f"Unable to send lmcache caching lifespan message: {e}")
+            logger.debug("Unable to send lmcache caching lifespan message: %s", e)
 
     def list_to_histogram(self, data: List[float], buckets: List[float]) -> dict:
         histogram, _ = np.histogram(data, bins=buckets)
@@ -399,7 +395,7 @@ class ContinuousUsageContext:
 
 def InitializeUsageContext(
     config: LMCacheEngineConfig,
-    metadata: LMCacheEngineMetadata,
+    metadata: LMCacheMetadata,
     local_log: Optional[str] = None,
 ):
     server_url = urljoin(

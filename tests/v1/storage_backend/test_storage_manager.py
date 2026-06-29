@@ -27,9 +27,9 @@ import pytest
 import torch
 
 # First Party
-from lmcache.config import LMCacheEngineMetadata
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventType
+from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 
 
@@ -79,11 +79,12 @@ def storage_manager_config():
 @pytest.fixture
 def storage_manager_metadata():
     """Create test metadata for StorageManager."""
-    metadata = LMCacheEngineMetadata(
+    metadata = LMCacheMetadata(
         model_name="test_model",
         world_size=1,
+        local_world_size=1,
         worker_id=0,
-        fmt="vllm",
+        local_worker_id=0,
         kv_dtype=torch.bfloat16,
         kv_shape=(28, 2, 256, 8, 128),
         role="scheduler",
@@ -115,10 +116,15 @@ class TestStorageManagerPrefetchCallback:
         cum_chunk_lengths_total = [0, 256, 512, 768, 1024, 1280]
         tier_expected_chunks = [3, 2]
 
-        # Create mock memory objects for all chunks
+        # Create mock memory objects for all chunks. At runtime,
+        # gather_with_keys() in async_lookup_and_prefetch produces
+        # (key, mem_obj) tuples per chunk, so res mirrors that shape.
         tier0_objs = [MockMemoryObj(i) for i in range(3)]
         tier1_objs = [MockMemoryObj(i + 3) for i in range(2)]
-        res = [tier0_objs, tier1_objs]
+        res = [
+            [(f"k{i}", obj) for i, obj in enumerate(tier0_objs)],
+            [(f"k{i + 3}", obj) for i, obj in enumerate(tier1_objs)],
+        ]
 
         # Create a mock future that returns the result
         loop = asyncio.new_event_loop()
@@ -158,7 +164,11 @@ class TestStorageManagerPrefetchCallback:
         tier0_objs = [MockMemoryObj(i) for i in range(3)]
         tier1_objs = [MockMemoryObj(i + 3) for i in range(1)]  # Only 1 instead of 2
         tier2_objs = [MockMemoryObj(i + 5) for i in range(2)]  # Got all 2
-        res = [tier0_objs, tier1_objs, tier2_objs]
+        res = [
+            [(f"k{i}", obj) for i, obj in enumerate(tier0_objs)],
+            [(f"k{i + 3}", obj) for i, obj in enumerate(tier1_objs)],
+            [(f"k{i + 5}", obj) for i, obj in enumerate(tier2_objs)],
+        ]
 
         # Create a mock future that returns the result
         loop = asyncio.new_event_loop()
@@ -206,7 +216,11 @@ class TestStorageManagerPrefetchCallback:
         tier0_objs = [MockMemoryObj(i) for i in range(2)]  # Only 2 instead of 3
         tier1_objs = [MockMemoryObj(i + 3) for i in range(2)]  # Got all 2
         tier2_objs = [MockMemoryObj(i + 5) for i in range(2)]  # Got all 2
-        res = [tier0_objs, tier1_objs, tier2_objs]
+        res = [
+            [(f"k{i}", obj) for i, obj in enumerate(tier0_objs)],
+            [(f"k{i + 3}", obj) for i, obj in enumerate(tier1_objs)],
+            [(f"k{i + 5}", obj) for i, obj in enumerate(tier2_objs)],
+        ]
 
         # Create a mock future that returns the result
         loop = asyncio.new_event_loop()
@@ -250,7 +264,10 @@ class TestStorageManagerPrefetchCallback:
         # All chunks retrieved successfully
         tier0_objs = [MockMemoryObj(i) for i in range(2)]
         tier1_objs = [MockMemoryObj(i + 2) for i in range(1)]
-        res = [tier0_objs, tier1_objs]
+        res = [
+            [(f"k{i}", obj) for i, obj in enumerate(tier0_objs)],
+            [(f"k{i + 2}", obj) for i, obj in enumerate(tier1_objs)],
+        ]
 
         # Create a mock future that returns the result
         loop = asyncio.new_event_loop()
@@ -287,7 +304,7 @@ class TestStorageManagerPrefetchCallback:
 
         # Only got 3 chunks instead of 5
         tier0_objs = [MockMemoryObj(i) for i in range(3)]
-        res = [tier0_objs]
+        res = [[(f"k{i}", obj) for i, obj in enumerate(tier0_objs)]]
 
         # Create a mock future that returns the result
         loop = asyncio.new_event_loop()
@@ -316,3 +333,38 @@ class TestStorageManagerPrefetchCallback:
         # (no remaining chunks in current tier, no subsequent tiers)
         for obj in tier0_objs:
             assert not obj.ref_count_down_called
+
+    def test_layerwise_partial_chunk_tail_released(self, storage_manager):
+        """keys_per_chunk=4, backend returns 7 mem_objs for 2 chunks (8 keys);
+        the 3 mem_objs in the rounded-off partial-chunk tail must be released."""
+        keys_per_chunk = 4
+        cum_chunk_lengths_total = [0, 256, 512]
+        tier_expected_chunks = [2]
+
+        tier0_objs = [MockMemoryObj(i) for i in range(7)]
+        res = [[(f"k{i}", obj) for i, obj in enumerate(tier0_objs)]]
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        future = loop.create_future()
+        future.set_result(res)
+        storage_manager.event_manager.add_event(
+            EventType.LOADING, "test_layerwise_tail", future
+        )
+
+        storage_manager.prefetch_all_done_callback(
+            future,
+            "test_layerwise_tail",
+            cum_chunk_lengths_total,
+            tier_expected_chunks,
+            keys_per_chunk=keys_per_chunk,
+        )
+        loop.close()
+
+        assert storage_manager.async_lookup_server.responses == [
+            ("test_layerwise_tail", 256)
+        ]
+        for obj in tier0_objs[:4]:
+            assert not obj.ref_count_down_called
+        for obj in tier0_objs[4:]:
+            assert obj.ref_count_down_called

@@ -4,7 +4,9 @@ from typing import TYPE_CHECKING, Any
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.cache_controller.controllers.full_sync_tracker import FullSyncTracker
 from lmcache.v1.cache_controller.message import (
+    BatchedKVOperationMsg,
     BatchedP2PLookupMsg,
     BatchedP2PLookupRetMsg,
     CheckFinishMsg,
@@ -15,13 +17,18 @@ from lmcache.v1.cache_controller.message import (
     CompressRetMsg,
     DecompressMsg,
     DecompressRetMsg,
-    KVAdmitMsg,
-    KVEvictMsg,
-    KVOperationMsg,
+    FullSyncBatchMsg,
+    FullSyncEndMsg,
+    FullSyncStartMsg,
+    FullSyncStartRetMsg,
+    FullSyncStatusMsg,
+    FullSyncStatusRetMsg,
+    KVOpEvent,
     LookupMsg,
     LookupRetMsg,
     MoveMsg,
     MoveRetMsg,
+    OpType,
     PinMsg,
     PinRetMsg,
 )
@@ -38,7 +45,7 @@ logger = init_logger(__name__)
 
 """
 The kv controller use `(instance_id, worker_id)` -> [location -> set[chunk_hash]] 
-as kv_pool. When the the number of instance is small and stable, the time complexity 
+as kv_pool. When the number of instances is small and stable, the time complexity 
 of `lookup` in kv controller is O(n). If the number of instance is large or unknown, 
 the time complexity will degrade to O(n^2), and the ReverseIndexKVController is a 
 better choice.
@@ -46,62 +53,46 @@ better choice.
 
 
 class KVController:
-    def __init__(self, registry: RegistryTree) -> None:
+    def __init__(
+        self,
+        registry: RegistryTree,
+        full_sync_completion_threshold: float = 0.8,
+        full_sync_timeout_s: float = 300.0,
+    ) -> None:
         # TODO(Jiayi): remove this hardcode
         self.token_database = ChunkedTokenDatabase()
-
-        # Track sequence discontinuity count for metrics
-        self.seq_discontinuity_count = 0
-
         self.registry = registry
         self.cluster_executor: Any = None
+
+        # Full sync tracker
+        self.full_sync_tracker = FullSyncTracker(
+            registry_tree=registry,
+            completion_threshold=full_sync_completion_threshold,
+            sync_timeout_s=full_sync_timeout_s,
+        )
 
     def _setup_metrics(self) -> None:
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
         if prometheus_logger is not None:
-            # TODO(baoloongmao): Cache values for better performance
-            prometheus_logger.kv_pool_keys_count.set_function(self._get_kv_pool_size)
+            prometheus_logger.kv_pool_keys_count.set_function(
+                self.registry.get_total_kv_count
+            )
             prometheus_logger.kv_op_seq_discontinuity_count.set_function(
-                lambda: self.seq_discontinuity_count
+                self.registry.get_seq_discontinuity_count
             )
-
-    def _get_kv_pool_size(self) -> int:
-        return self.registry.get_total_kv_count()
-
-    def check_sequence_number(self, msg: KVOperationMsg) -> None:
-        """
-        Check if the sequence number is continuous for the given source.
-
-        Args:
-            msg: KVOperationMsg
-        """
-        instance_id = msg.instance_id
-        worker_id = msg.worker_id
-        location = msg.location
-        seq_num = msg.seq_num
-
-        last_seq_num = self.registry.get_seq_num(instance_id, worker_id, location)
-
-        if last_seq_num is None:
-            # First message from this source
-            self.registry.update_seq_num(instance_id, worker_id, location, seq_num)
-            return
-
-        expected_seq = last_seq_num + 1
-        if seq_num != expected_seq:
-            # Sequence number discontinuity detected
-            self.seq_discontinuity_count += 1
-            logger.warning(
-                "KV operation sequence discontinuity detected: "
-                "key=%s, expected_seq=%s, actual_seq=%s, gap=%s",
-                (instance_id, worker_id, location),
-                expected_seq,
-                seq_num,
-                seq_num - expected_seq,
+            # Full sync metrics
+            prometheus_logger.full_sync_workers_syncing.set_function(
+                self.full_sync_tracker.get_syncing_count
             )
-
-        # Update tracker with current sequence number
-        self.registry.update_seq_num(instance_id, worker_id, location, seq_num)
+            prometheus_logger.full_sync_workers_completed.set_function(
+                self.full_sync_tracker.get_completed_count
+            )
+            prometheus_logger.full_sync_global_progress.set_function(
+                self.full_sync_tracker.get_global_progress
+            )
+            prometheus_logger.full_sync_missing_batches_total.set_function(
+                self.full_sync_tracker.get_total_missing_batches_count
+            )
 
     def post_init(
         self, reg_controller: "RegistrationController", cluster_executor: Any
@@ -155,17 +146,236 @@ class KVController:
         assert self.cluster_executor is not None
         return await self.cluster_executor.execute("check_finish", msg)
 
-    async def admit(self, msg: KVAdmitMsg) -> None:
-        """
-        Admit a new kv chunk.
-        """
-        self.registry.admit_kv(msg.instance_id, msg.worker_id, msg.location, msg.key)
+    async def handle_batched_kv_operations(self, msg: BatchedKVOperationMsg) -> None:
+        """Handle batched KV operations by forwarding to registry."""
+        if not msg.operations:
+            return
 
-    async def evict(self, msg: KVEvictMsg) -> None:
+        # Check if worker is currently in full sync
+        if self.full_sync_tracker.is_worker_syncing(msg.instance_id, msg.worker_id):
+            # During full sync, incremental operations should be discarded
+            logger.debug(
+                "Discarding incremental KV operations during full sync: "
+                "instance=%s, worker=%d, sync_id=%s, operation_count=%d",
+                msg.instance_id,
+                msg.worker_id,
+                self.full_sync_tracker.get_sync_id(msg.instance_id, msg.worker_id),
+                len(msg.operations),
+            )
+            return
+
+        if not self.registry.handle_batched_kv_operations(msg):
+            logger.warning(
+                "Failed to handle batched KV operations, instance: %s, worker: %d",
+                msg.instance_id,
+                msg.worker_id,
+            )
+
+    # ============= Full Sync Message Handlers =============
+
+    async def handle_full_sync_start(
+        self, msg: FullSyncStartMsg
+    ) -> FullSyncStartRetMsg:
         """
-        Evict a kv chunk.
+        Handle full sync start request from a worker.
+
+        This is called when a worker wants to start full sync.
+        The controller should:
+        1. Clear existing keys for this worker
+        2. Mark the worker as syncing (incremental events will be discarded)
+        3. Return acceptance
         """
-        self.registry.evict_kv(msg.instance_id, msg.worker_id, msg.location, msg.key)
+        instance_id = msg.instance_id
+        worker_id = msg.worker_id
+        sync_id = msg.sync_id
+        report_id = (instance_id, worker_id)
+
+        # Start sync tracking first (mark worker as SYNCING)
+        success = self.full_sync_tracker.start_sync(
+            instance_id=instance_id,
+            worker_id=worker_id,
+            sync_id=sync_id,
+            total_keys=msg.total_keys,
+            batch_count=msg.batch_count,
+        )
+
+        if not success:
+            logger.warning(
+                "Failed to start sync for worker %s: sync_id=%s", report_id, sync_id
+            )
+            return FullSyncStartRetMsg(
+                sync_id=sync_id,
+                accepted=False,
+                error_msg="Failed to start sync: worker already syncing with "
+                "different sync_id or worker not found",
+            )
+
+        # Now clear existing keys for this worker/location using efficient batch method
+        # This prevents new incremental messages from being processed while we clear
+        existing_keys = self.registry.get_worker_kv_keys(
+            instance_id, worker_id, msg.location
+        )
+        if existing_keys:
+            old_count = len(existing_keys)
+            # Use efficient batch clear method
+            cleared = self.registry.clear_worker_kv(
+                instance_id, worker_id, msg.location
+            )
+            if cleared:
+                logger.info(
+                    "Cleared %d existing keys for worker %s location %s "
+                    "before full sync",
+                    old_count,
+                    report_id,
+                    msg.location,
+                )
+            else:
+                logger.warning(
+                    "Failed to clear keys for worker %s location %s",
+                    report_id,
+                    msg.location,
+                )
+
+        logger.info(
+            "Accepted full sync start: worker=%s, sync_id=%s, "
+            "total_keys=%d, batch_count=%d",
+            report_id,
+            sync_id,
+            msg.total_keys,
+            msg.batch_count,
+        )
+        return FullSyncStartRetMsg(sync_id=sync_id, accepted=True)
+
+    async def handle_full_sync_batch(self, msg: FullSyncBatchMsg) -> None:
+        """
+        Handle full sync batch message from a worker.
+
+        This adds the keys from the batch to the registry.
+        """
+        instance_id = msg.instance_id
+        worker_id = msg.worker_id
+        location = msg.location
+        sync_id = msg.sync_id
+        batch_id = msg.batch_id
+        keys = msg.keys
+        report_id = (instance_id, worker_id)
+
+        # Record batch receipt
+        if not self.full_sync_tracker.receive_batch(
+            instance_id=instance_id,
+            worker_id=worker_id,
+            sync_id=sync_id,
+            batch_id=batch_id,
+            keys_count=len(keys),
+        ):
+            logger.warning(
+                "Failed to record batch %d for worker %s", batch_id, report_id
+            )
+            return
+
+        # Add keys to registry using batched operations
+        operations = []
+        for seq_num, key in enumerate(keys):
+            operations.append(
+                KVOpEvent(
+                    op_type=OpType.ADMIT,
+                    key=key,
+                    seq_num=seq_num,
+                )
+            )
+        if operations:
+            batch_msg = BatchedKVOperationMsg(
+                instance_id=instance_id,
+                worker_id=worker_id,
+                location=location,
+                operations=operations,
+            )
+            self.registry.handle_batched_kv_operations(batch_msg, is_full_sync=True)
+
+        current_keys = self.registry.get_worker_kv_keys(
+            instance_id, worker_id, location
+        )
+        logger.debug(
+            "Added %d keys from batch %d for worker %s, total now: %d",
+            len(keys),
+            batch_id,
+            report_id,
+            len(current_keys),
+        )
+
+    async def handle_full_sync_end(self, msg: FullSyncEndMsg) -> None:
+        """
+        Handle full sync end message from a worker.
+
+        This marks the sync as end-received and records actual total keys.
+        """
+        instance_id = msg.instance_id
+        worker_id = msg.worker_id
+        sync_id = msg.sync_id
+        actual_total_keys = msg.actual_total_keys
+        report_id = (instance_id, worker_id)
+
+        success = self.full_sync_tracker.complete_sync(
+            instance_id=instance_id,
+            worker_id=worker_id,
+            sync_id=sync_id,
+            actual_total_keys=actual_total_keys,
+        )
+
+        if success:
+            # Verify registry has the expected number of keys
+            actual_keys_in_pool = len(
+                self.registry.get_worker_kv_keys(instance_id, worker_id, msg.location)
+            )
+            logger.info(
+                "Full sync completed for worker %s: sync_id=%s, "
+                "reported_keys=%d, keys_in_pool=%d",
+                report_id,
+                sync_id,
+                actual_total_keys,
+                actual_keys_in_pool,
+            )
+        else:
+            logger.warning(
+                "Failed to complete full sync for worker %s: sync_id=%s",
+                report_id,
+                sync_id,
+            )
+
+    async def handle_full_sync_status(
+        self, msg: FullSyncStatusMsg
+    ) -> FullSyncStatusRetMsg:
+        """
+        Handle full sync status query from a worker.
+
+        Returns the sync status including any missing batches that need resending.
+        """
+        is_complete, global_progress, can_exit_freeze, missing_batches = (
+            self.full_sync_tracker.get_sync_status(
+                instance_id=msg.instance_id,
+                worker_id=msg.worker_id,
+                sync_id=msg.sync_id,
+            )
+        )
+
+        if missing_batches:
+            logger.info(
+                "Full sync status query: worker=(%s, %d), sync_id=%s, "
+                "is_complete=%s, missing_batches=%s",
+                msg.instance_id,
+                msg.worker_id,
+                msg.sync_id,
+                is_complete,
+                missing_batches,
+            )
+
+        return FullSyncStatusRetMsg(
+            sync_id=msg.sync_id,
+            is_complete=is_complete,
+            global_progress=global_progress,
+            can_exit_freeze=can_exit_freeze,
+            missing_batches=missing_batches,
+        )
 
     # TODO(Jiayi): The current implementation does not handle
     # the case where the prefix chunks are evicted while the
@@ -200,33 +410,30 @@ class KVController:
 
         :return: A BatchedP2PLookupRetMsg containing the lookup results.
         """
-        if len(msg.hashes) == 0:
+        hashes = msg.hashes
+        if not hashes:
             return BatchedP2PLookupRetMsg(layout_info=[("", "", 0, "")])
 
-        result = self.registry.find_kv(
-            msg.hashes[0],
-            exclude_instance_id=msg.instance_id,
+        # Single lookup to get all needed info (optimized path)
+        result = self.registry.find_kv_with_worker_info(
+            hashes[0], exclude_instance_id=msg.instance_id
         )
         if result is None:
             return BatchedP2PLookupRetMsg(layout_info=[("", "", 0, "")])
 
-        instance_id = result.instance_id
-        worker_id = result.worker_id
-        location = result.location
-        assert self.reg_controller is not None
-        peer_init_url = self.reg_controller.get_peer_init_url(instance_id, worker_id)
-        assert peer_init_url is not None
-        current_instance_keys = self.registry.get_worker_kv_keys(
-            instance_id, worker_id, location
-        )
+        kv_info, peer_init_url, current_keys = result
+        if peer_init_url is None:
+            return BatchedP2PLookupRetMsg(layout_info=[("", "", 0, "")])
+
+        # Count hits efficiently
         num_hit_chunks = 0
-        for key in msg.hashes:
-            if key not in current_instance_keys:
+        for key in hashes:
+            if key not in current_keys:
                 break
             num_hit_chunks += 1
 
         return BatchedP2PLookupRetMsg(
             layout_info=[
-                (instance_id, location, num_hit_chunks, peer_init_url),
+                (kv_info.instance_id, kv_info.location, num_hit_chunks, peer_init_url),
             ]
         )

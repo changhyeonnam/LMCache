@@ -6,7 +6,7 @@ from typing import List, Optional
 import torch
 
 # First Party
-from lmcache.config import LMCacheEngineConfig, LMCacheEngineMetadata
+from lmcache import torch_device_type
 from lmcache.logging import init_logger
 from lmcache.storage_backend.serde.cachegen_basics import (
     CacheGenConfig,
@@ -15,11 +15,9 @@ from lmcache.storage_backend.serde.cachegen_basics import (
 )
 from lmcache.storage_backend.serde.serde import Deserializer
 from lmcache.utils import _lmcache_nvtx_annotate
-
-if torch.cuda.is_available():
-    import lmcache.c_ops as lmc_ops
-
-# First Party
+from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.metadata import LMCacheMetadata
+import lmcache.c_ops as lmc_ops
 import lmcache.storage_backend.serde.cachegen_basics as CGBasics
 
 logger = init_logger(__name__)
@@ -120,14 +118,13 @@ class CacheGenDeserializer(Deserializer):
     def __init__(
         self,
         config: LMCacheEngineConfig,
-        metadata: LMCacheEngineMetadata,
+        metadata: LMCacheMetadata,
         dtype,
     ):
         self.dtype = dtype
         self.cachegen_config = CacheGenConfig.from_model_name(metadata.model_name)
         self.chunk_size = config.chunk_size
         self.output_buffer: Optional[torch.Tensor] = None
-        self.fmt = metadata.fmt
         self.key_bins = self.make_key_bins(self.cachegen_config)
         self.value_bins = self.make_value_bins(self.cachegen_config)
 
@@ -135,13 +132,13 @@ class CacheGenDeserializer(Deserializer):
         ret = torch.zeros(config.nlayers)
         for spec in config.kspecs:
             ret[spec.start_layer : spec.end_layer] = spec.bins
-        return ret.cuda()
+        return ret.to(torch_device_type)
 
     def make_value_bins(self, config: CacheGenConfig) -> torch.Tensor:
         ret = torch.zeros(config.nlayers)
         for spec in config.vspecs:
             ret[spec.start_layer : spec.end_layer] = spec.bins
-        return ret.cuda()
+        return ret.to(torch_device_type)
 
     def get_output_buffer(self, nlayers: int, nchannels: int, ntokens: int):
         if (
@@ -150,14 +147,18 @@ class CacheGenDeserializer(Deserializer):
         ):
             self.output_buffer = torch.zeros(
                 (self.chunk_size, 2 * nlayers * nchannels), dtype=torch.uint8
-            ).cuda()
+            ).to(torch_device_type)
         return self.output_buffer[:ntokens, :]
 
     @_lmcache_nvtx_annotate
     def from_bytes(self, bs: bytes) -> torch.Tensor:
         encoder_output = CacheGenGPUEncoderOutput.from_bytes(bs)
-        encoder_output.max_tensors_key = encoder_output.max_tensors_key.cuda()
-        encoder_output.max_tensors_value = encoder_output.max_tensors_value.cuda()
+        encoder_output.max_tensors_key = encoder_output.max_tensors_key.to(
+            torch_device_type
+        )
+        encoder_output.max_tensors_value = encoder_output.max_tensors_value.to(
+            torch_device_type
+        )
 
         ntokens = encoder_output.max_tensors_key.shape[1]
         layers_in_key = encoder_output.max_tensors_key.shape[0]
@@ -185,7 +186,7 @@ class CacheGenDeserializer(Deserializer):
             self.key_bins = self.key_bins.to(key.device)
 
         if self.value_bins.device != value.device:
-            self.value_bins = self.value_bins.cuda()
+            self.value_bins = self.value_bins.to(value.device)
 
         key = do_dequantize(key, self.key_bins, encoder_output.max_tensors_key)
         value = do_dequantize(value, self.value_bins, encoder_output.max_tensors_value)
@@ -201,14 +202,11 @@ class CacheGenDeserializer(Deserializer):
                 encoder_output.head_size,
             )
         )
-        match self.fmt:
-            case "vllm":
-                return blob.permute((1, 0, 2, 3, 4)).to(
-                    self.dtype
-                )  # [nlayers, 2, ntokens, num_heads, head_size]
-            case "huggingface":
-                return blob.permute((1, 0, 3, 2, 4)).to(
-                    self.dtype
-                )  # [nlayers, 2, num_heads, ntokens, head_size]
-            case _:
-                raise RuntimeError("Unknown format %s" % self.fmt)
+
+        return blob.permute((1, 0, 2, 3, 4)).to(
+            self.dtype
+        )  # [nlayers, 2, ntokens, num_heads, head_size]
+        # huggingface
+        # return blob.permute((1, 0, 3, 2, 4)).to(
+        #     self.dtype
+        # )  # [nlayers, 2, num_heads, ntokens, head_size]

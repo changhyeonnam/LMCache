@@ -196,6 +196,8 @@ class RequestExecutor:
         tokens_out = tok.usage.completion_tokens
         tokens_prefill = tok.usage.prompt_tokens
         finish_time = time.time()
+        if first_token_time is None:
+            first_token_time = finish_time
         return Response(
             request_id=request_id,
             body=words,
@@ -423,7 +425,7 @@ def main():
     args.query_prompt = args.query_prompt.encode().decode("unicode_escape")
     if args.verbose:
         global logger
-        logger = init_logger(__name__, level=logging.DEBUG)
+        logger = init_logger(__name__, logging.DEBUG)
     run_rag(args)
 
 

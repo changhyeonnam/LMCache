@@ -24,7 +24,7 @@ Two ways to configure LMCache Disk Offloading:
     # Otherwise, enable by setting the directory where LMCache will
     # create files for each KV cache chunks
     # (this directory does NOT need to exist beforehand)
-    export LMCACHE_LOCAL_DISK="file:///local/disk_test/local_disk/"
+    export LMCACHE_LOCAL_DISK="file://$HOME/local/disk_test/local_disk/"
     # 5GB of Disk
     export LMCACHE_MAX_LOCAL_DISK_SIZE=5.0
 
@@ -49,6 +49,58 @@ Passed in through ``LMCACHE_CONFIG_FILE=your-lmcache-config.yaml``
     # This should be turned on for better performance if most local CPU memory is used
     extra_config: {'use_odirect': True}
 
+
+Multi-Path (Multi-Device) Disk Offloading
+-----------------------------------------
+
+If you have **multiple NVMe devices** (or any independent mount points), you can
+assign each GPU its own disk path so that each device writes to a dedicated drive.
+
+Specify a **comma-separated list** of paths in ``local_disk``.
+Each path can optionally use the ``file://`` prefix.  The
+``local_disk_path_sharding`` option controls how each GPU worker selects its
+path.  Currently only ``"by_gpu"`` is supported (the default), which selects a
+path based on the device index (``device_id % num_paths``), so all KV cache
+files from a given GPU land on the same NVMe.  This is especially useful when
+GPUs and NVMe devices share a PCIe switch or NUMA node.
+
+For example, with two GPUs and two paths:
+
+- ``cuda:0`` → ``/mnt/nvme0/kvcache/``
+- ``cuda:1`` → ``/mnt/nvme1/kvcache/``
+
+``max_local_disk_size`` is the **total budget** shared across all paths.
+
+**Environment variable example:**
+
+.. code-block:: bash
+
+    export LMCACHE_LOCAL_DISK="file:///mnt/nvme0/kvcache/,file:///mnt/nvme1/kvcache/"
+    export LMCACHE_LOCAL_DISK_PATH_SHARDING="by_gpu"
+    export LMCACHE_MAX_LOCAL_DISK_SIZE=20.0   # combined budget (GB)
+
+**YAML example:**
+
+.. code-block:: yaml
+
+    local_disk: "/mnt/nvme0/kvcache/,/mnt/nvme1/kvcache/"
+    local_disk_path_sharding: "by_gpu"
+    max_local_disk_size: 20.0
+
+.. note::
+
+    Each GPU worker uses only its assigned path, so O_DIRECT alignment
+    is determined by that path's filesystem block size.  Different
+    devices may have different block sizes without issue.
+
+.. tip::
+
+    If you are able to use kernel-level RAID 0 (e.g. ``mdadm --level=0``)
+    you will get true block-level striping (even a single large file can
+    use bandwidth from both devices simultaneously).  The multi-path
+    feature is most useful when you cannot or do not want to reconfigure
+    the block devices — for example, when they already have other data.
+
 Local Storage Explanation:
 --------------------------
 
@@ -64,6 +116,105 @@ backends have asynchronous put() operations so that the IO latency will not slow
 The local disk backend also has a prefetch() operation that will preemptively move KV caches from the disk to CPU RAM offloading storage
 (i.e. ``LMCACHE_LOCAL_CPU=True`` should be set, see :doc:`CPU RAM <./cpu_ram>`) for specified tokens (these KV caches are also still kept in the disk).
 
+
+Architecture Overview
+---------------------
+
+The following diagram shows the overall architecture of the Local Disk Backend:
+
+.. mermaid::
+
+    %%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '18px', 'fontFamily': 'arial', 'primaryColor': '#e3f2fd', 'primaryTextColor': '#000', 'primaryBorderColor': '#1976d2', 'lineColor': '#424242', 'secondaryColor': '#f5f5f5', 'tertiaryColor': '#ffffff', 'background': '#ffffff', 'clusterBkg': '#f8f9fa', 'clusterBorder': '#495057' }}}%%
+    flowchart TB
+        subgraph Engine["<b>LMCache Engine</b>"]
+            E["<b>Request Save/Load Operations</b>"]
+        end
+
+        subgraph LDB["<b>LocalDiskBackend</b>"]
+            subgraph Meta["<b>Metadata Dictionary</b>"]
+                Dict["<b>self.dict: CacheEngineKey → DiskCacheMetadata</b>
+                (path, size, shape, dtype, pinned, positions)"]
+            end
+            
+            subgraph Policy["<b>Cache Policy</b>"]
+                CP["<b>Configurable Policy</b>
+                (LRU, LFU, FIFO, MRU)
+                Decides what to evict"]
+            end
+            
+            subgraph Worker["<b>LocalDiskWorker</b>"]
+                PQ["<b>Priority Queue Executor (4 workers)</b>"]
+                P0["<b>Priority 0: PREFETCH</b>"]
+                P1["<b>Priority 1: DELETE</b>"]
+                P2["<b>Priority 2: PUT</b>"]
+            end
+            
+            CPU["<b>LocalCPUBackend</b>
+            (memory allocator)"]
+        end
+
+        subgraph Disk["<b>Local Filesystem</b>"]
+            Files["/cache/vllm@model@...@abc.pt
+            /cache/vllm@model@...@def.pt
+            /cache/vllm@model@...@ghi.pt"]
+        end
+
+        E --> Dict
+        Dict --> CP
+        CP --> PQ
+        PQ --> P0
+        PQ --> P1
+        PQ --> P2
+        Worker --> Files
+        CPU -.-> Worker
+
+**Key Components:**
+
+- **Metadata Dictionary**: Maps each ``CacheEngineKey`` to its disk metadata (file path, size, shape, dtype, pin status)
+- **Cache Policy**: Configurable eviction policy (LRU, LFU, FIFO, or MRU) that tracks access patterns and decides which entries to evict when space is needed
+- **LocalDiskWorker**: Async task executor with priority queue - prefetch tasks run first (priority 0), then deletes (priority 1), then saves (priority 2)
+- **Local Disk**: Filesystem where KV cache chunks are stored as individual ``.pt`` files
+
+
+Save Flow (PUT)
+~~~~~~~~~~~~~~~
+
+.. mermaid::
+
+    %%{init: {'theme': 'base', 'flowchart': {'useMaxWidth': false, 'htmlLabels': true, 'nodeSpacing': 30, 'rankSpacing': 30}, 'themeVariables': { 'fontSize': '18px', 'fontFamily': 'arial', 'primaryColor': '#e3f2fd', 'primaryTextColor': '#000', 'primaryBorderColor': '#1976d2', 'lineColor': '#424242', 'secondaryColor': '#f5f5f5', 'tertiaryColor': '#ffffff', 'background': '#ffffff', 'clusterBkg': '#f8f9fa', 'clusterBorder': '#495057' }}}%%
+    flowchart LR
+        A["<b>MemoryObj</b><br/>(KV cache in CPU memory)"] --> B{<b>Disk space<br/>available?</b>}
+        B -->|"No"| C["<b>Evict via policy</b><br/>Delete .pt files"]
+        C --> B
+        B -->|"Yes"| D["<b>Track in put_tasks</b><br/>Queue async write<br/>(Priority 2 - lowest)"]
+        D --> E["<b>LocalDiskWorker</b><br/>write_file()"]
+        E --> F[("<b>Disk</b><br/>.pt file")]
+        F --> G["<b>Add to metadata dict</b>"]
+
+        style A fill:#e1f5fe
+        style F fill:#c8e6c9
+        style C fill:#ffcdd2
+
+Load Flow (GET)
+~~~~~~~~~~~~~~~
+
+.. mermaid::
+
+    %%{init: {'theme': 'base', 'flowchart': {'useMaxWidth': false, 'htmlLabels': true, 'nodeSpacing': 30, 'rankSpacing': 30}, 'themeVariables': { 'fontSize': '18px', 'fontFamily': 'arial', 'primaryColor': '#e3f2fd', 'primaryTextColor': '#000', 'primaryBorderColor': '#1976d2', 'lineColor': '#424242', 'secondaryColor': '#f5f5f5', 'tertiaryColor': '#ffffff', 'background': '#ffffff', 'clusterBkg': '#f8f9fa', 'clusterBorder': '#495057' }}}%%
+    flowchart LR
+        A["<b>Request</b><br/>(CacheEngineKey)"] --> B{<b>Key exists<br/>in dict?</b>}
+        B -->|"No"| C["<b>Return None</b><br/>(cache miss)"]
+        B -->|"Yes"| D["<b>Update policy</b><br/>Mark as accessed"]
+        D --> E["<b>Allocate buffer</b><br/>via LocalCPUBackend"]
+        E --> F["<b>Read from disk</b><br/>read_file()"]
+        F --> G[("<b>Disk</b><br/>.pt file")]
+        G --> F
+        F --> H["<b>MemoryObj</b><br/>(KV cache ready)"]
+
+        style A fill:#e1f5fe
+        style H fill:#c8e6c9
+        style C fill:#ffcdd2
+        
 .. _local-storage-online-inference-example:
 
 Online Inference Example
@@ -288,6 +439,11 @@ If you look at the logs of your vLLM server, you should see (the logs are trunca
     LMCache INFO: Reqid: chatcmpl-136d9dac1ba94bd4b4ae85007e8ad437, Total tokens 15410,
     LMCache hit tokens: 15409, need to load: 1
 
+Check out your KV Cache in your SSD:
+
+.. code-block:: bash
+
+    ls "$HOME/local/disk_test/local_disk/"
 
 .. _local-storage-tips:
 

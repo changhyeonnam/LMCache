@@ -10,16 +10,13 @@ import pytest
 import torch
 
 # First Party
-from lmcache.config import LMCacheEngineMetadata
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import (
-    AdHocMemoryAllocator,
-    MemoryFormat,
-    MemoryObj,
-)
+from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+from tests.v1.utils import create_test_memory_obj
 
 
 def create_test_config(fs_path: str):
@@ -33,13 +30,43 @@ def create_test_config(fs_path: str):
     return config
 
 
+def create_test_config_with_plugin(fs_path: str):
+    """Create a test configuration for FSConnector using remote_storage_plugins."""
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        remote_storage_plugins=["fs"],
+        remote_serde="naive",
+        lmcache_instance_id="test_instance",
+        extra_config={
+            "remote_storage_plugin.fs.base_path": fs_path,
+        },
+    )
+    return config
+
+
+def create_test_config_with_dual_plugins(fs_path1: str, fs_path2: str):
+    """Create config with two fs_connector instances."""
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        remote_storage_plugins=["fs.primary", "fs.backup"],
+        remote_serde="naive",
+        lmcache_instance_id="test_instance",
+        extra_config={
+            "remote_storage_plugin.fs.primary.base_path": fs_path1,
+            "remote_storage_plugin.fs.backup.base_path": fs_path2,
+        },
+    )
+    return config
+
+
 def create_test_metadata():
-    """Create a test metadata for LMCacheEngineMetadata."""
-    return LMCacheEngineMetadata(
+    """Create a test metadata for LMCacheMetadata."""
+    return LMCacheMetadata(
         model_name="test_model",
         world_size=1,
+        local_world_size=1,
         worker_id=0,
-        fmt="vllm",
+        local_worker_id=0,
         kv_dtype=torch.bfloat16,
         kv_shape=(28, 2, 256, 8, 128),
     )
@@ -47,14 +74,13 @@ def create_test_metadata():
 
 def create_test_key(key_id: int = 0) -> CacheEngineKey:
     """Create a test CacheEngineKey."""
-    return CacheEngineKey("vllm", "test_model", 3, 123, hash(key_id), torch.bfloat16)
-
-
-def create_test_memory_obj(shape=(2, 16, 8, 128), dtype=torch.bfloat16) -> MemoryObj:
-    """Create a test MemoryObj using AdHocMemoryAllocator for testing."""
-    allocator = AdHocMemoryAllocator(device="cpu")
-    memory_obj = allocator.allocate(shape, dtype, fmt=MemoryFormat.KV_T2D)
-    return memory_obj
+    return CacheEngineKey(
+        model_name="test_model",
+        world_size=3,
+        worker_id=1,
+        chunk_hash=hash(key_id),
+        dtype=torch.bfloat16,
+    )
 
 
 @pytest.fixture
@@ -97,7 +123,8 @@ def async_loop():
 def local_cpu_backend(memory_allocator):
     """Create a LocalCPUBackend for testing."""
     config = LMCacheEngineConfig.from_legacy(chunk_size=256)
-    return LocalCPUBackend(config, memory_allocator=memory_allocator)
+    metadata = create_test_metadata()
+    return LocalCPUBackend(config, metadata, memory_allocator=memory_allocator)
 
 
 @pytest.fixture
@@ -140,6 +167,82 @@ class TestFSConnector:
 
         local_cpu_backend.memory_allocator.close()
         backend.close()
+
+    def test_init_with_plugin(self, temp_fs_path, async_loop, local_cpu_backend):
+        """Test FSConnector init via RemoteBackend
+        using remote_storage_plugins."""
+        config = create_test_config_with_plugin(temp_fs_path)
+        metadata = create_test_metadata()
+        backend = RemoteBackend(
+            config=config,
+            metadata=metadata,
+            loop=async_loop,
+            local_cpu_backend=local_cpu_backend,
+            dst_device="cpu",
+            plugin_name="fs",
+        )
+
+        assert backend.dst_device == "cpu"
+        assert backend.local_cpu_backend == local_cpu_backend
+        assert backend.plugin_name == "fs"
+        assert os.path.exists(temp_fs_path)
+        assert backend.config.remote_serde == "naive"
+
+        local_cpu_backend.memory_allocator.close()
+        backend.close()
+
+    def test_dual_fs_instances(self, async_loop, local_cpu_backend):
+        """Test two fs_connector instances with different paths."""
+        dir1 = tempfile.mkdtemp()
+        dir2 = tempfile.mkdtemp()
+        try:
+            config = create_test_config_with_dual_plugins(dir1, dir2)
+            metadata = create_test_metadata()
+
+            backend1 = RemoteBackend(
+                config=config,
+                metadata=metadata,
+                loop=async_loop,
+                local_cpu_backend=local_cpu_backend,
+                dst_device="cpu",
+                plugin_name="fs.primary",
+            )
+            backend2 = RemoteBackend(
+                config=config,
+                metadata=metadata,
+                loop=async_loop,
+                local_cpu_backend=local_cpu_backend,
+                dst_device="cpu",
+                plugin_name="fs.backup",
+            )
+
+            key = create_test_key(99)
+            memory_obj = create_test_memory_obj()
+
+            # Put to backend1 only
+            future = backend1.submit_put_task(key, memory_obj)
+            if future:
+                future.result(timeout=5.0)
+
+            # backend1 has the key, backend2 does not
+            assert backend1.contains(key)
+            assert not backend2.contains(key)
+
+            # Put to backend2 as well
+            future2 = backend2.submit_put_task(key, memory_obj)
+            if future2:
+                future2.result(timeout=5.0)
+
+            assert backend2.contains(key)
+
+            backend1.close()
+            backend2.close()
+            local_cpu_backend.memory_allocator.close()
+        finally:
+            if os.path.exists(dir1):
+                shutil.rmtree(dir1)
+            if os.path.exists(dir2):
+                shutil.rmtree(dir2)
 
     def test_contains_key_not_exists(self, remote_backend_with_fs):
         """Test contains() when key doesn't exist in filesystem."""
@@ -286,6 +389,7 @@ class TestFSConnector:
         # Create new backend instance and verify data persists
         new_local_cpu_backend = LocalCPUBackend(
             LMCacheEngineConfig.from_legacy(chunk_size=256),
+            local_cpu_backend.metadata,
             memory_allocator=local_cpu_backend.memory_allocator,
         )
         new_backend = RemoteBackend(

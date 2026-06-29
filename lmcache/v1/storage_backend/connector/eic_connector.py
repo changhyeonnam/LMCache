@@ -72,9 +72,6 @@ class PerformanceTimer:
         logger.debug(f"== Perf op {self.op} size {self.size} =========")
 
 
-METADATA_BYTES_LEN = 28
-
-
 class FlexibleDRAMMemoryPool:
     def __init__(self, conn):
         self._init = False
@@ -118,6 +115,9 @@ class EICConnector(RemoteConnector):
         loop: asyncio.AbstractEventLoop,
         memory_allocator: LocalCPUBackend,
     ):
+        # initialize base class, which includes some common attributes
+        super().__init__(memory_allocator.config, memory_allocator.metadata)
+
         logger.info("init EICConnector")
         logger.info(f"try connect to eic: {endpoint}")
 
@@ -303,7 +303,7 @@ class EICConnector(RemoteConnector):
         # Get Meta: generate meta buffer tensor
         perf_timer.start("alloc_mem")
         meta_key = key_str + "_meta"
-        meta_size = METADATA_BYTES_LEN
+        meta_size = self.remote_metadata_bytes
         meta_bytes = bytearray(meta_size)
         meta_bytes_ptr = self.bytes_get_ptr(meta_bytes)
 
@@ -352,8 +352,8 @@ class EICConnector(RemoteConnector):
         perf_timer.start("total_cost")
         perf_timer.start("alloc_obj")
         memory_obj = self.memory_allocator.allocate(
-            meta.shape,
-            meta.dtype,
+            meta.shapes,
+            meta.dtypes,
             meta.fmt,
         )
         if memory_obj is None:
@@ -374,26 +374,37 @@ class EICConnector(RemoteConnector):
         perf_timer.set_size(obj_size)
         perf_timer.stop("alloc_mem")
 
-        if self.trans_type == eic.TransportType.TRANSPORT_GDR:
-            data_vals.append(data_ptr, obj_size, True)
-        else:
-            data_vals.append(data_ptr, obj_size, False)
+        try:
+            if self.trans_type == eic.TransportType.TRANSPORT_GDR:
+                data_vals.append(data_ptr, obj_size, True)
+            else:
+                data_vals.append(data_ptr, obj_size, False)
 
-        perf_timer.start("eic_mget")
-        get_option = eic.GetOption()
-        get_option.ns = self.eic_kv_ns
-        status_code, data_vals, get_outcome = self.connection.mget(
-            data_keys, get_option, data_vals
-        )
-        err_code = get_outcome.status_codes[0]
-        if status_code != eic.StatusCode.SUCCESS or err_code != eic.StatusCode.SUCCESS:
-            logger.error(
-                f"eic mget data {key_str} failed, status_code {status_code}"
-                " err_code {err_code}"
+            perf_timer.start("eic_mget")
+            get_option = eic.GetOption()
+            get_option.ns = self.eic_kv_ns
+            status_code, data_vals, get_outcome = self.connection.mget(
+                data_keys, get_option, data_vals
             )
+            err_code = get_outcome.status_codes[0]
+            if (
+                status_code != eic.StatusCode.SUCCESS
+                or err_code != eic.StatusCode.SUCCESS
+            ):
+                logger.error(
+                    f"eic mget data {key_str} failed, status_code {status_code} "
+                    f"err_code {err_code}"
+                )
+                memory_obj.ref_count_down()
+                return None
+            else:
+                logger.debug(f"eic mget data {key_str} success")
+        except Exception as e:
+            logger.error(
+                f"eic mget data {key_str} raised exception: {e}", exc_info=True
+            )
+            memory_obj.ref_count_down()
             return None
-        else:
-            logger.debug(f"eic mget data {key_str} success")
 
         perf_timer.stop("eic_mget")
 
@@ -438,8 +449,8 @@ class EICConnector(RemoteConnector):
         perf_timer.start("total_cost")
         kv_bytes = memory_obj.byte_array
         kv_tensor = memory_obj.tensor
-        kv_shape = memory_obj.get_shape()
-        kv_dtype = memory_obj.get_dtype()
+        kv_shapes = memory_obj.get_shapes()
+        kv_dtypes = memory_obj.get_dtypes()
         memory_format = memory_obj.get_memory_format()
         value_size = memory_obj.get_physical_size()
 
@@ -455,7 +466,7 @@ class EICConnector(RemoteConnector):
 
         # generate meta bytes
         remote_meta = RemoteMetadata(
-            METADATA_BYTES_LEN, kv_shape, kv_dtype, memory_format
+            self.remote_metadata_bytes, kv_shapes, kv_dtypes, memory_format
         )
 
         logger.debug(f"eic meta {key_str} remote_meta{remote_meta}")
@@ -537,15 +548,15 @@ class EICConnector(RemoteConnector):
             # Get memory object data
             kv_bytes = memory_obj.byte_array
             kv_tensor = memory_obj.tensor
-            kv_shape = memory_obj.get_shape()
-            kv_dtype = memory_obj.get_dtype()
+            kv_shapes = memory_obj.get_shapes()
+            kv_dtypes = memory_obj.get_dtypes()
             memory_format = memory_obj.get_memory_format()
             if kv_tensor is None:
                 logger.error(f"Memory object tensor is None for key {key_str}")
                 return
 
             remote_meta = RemoteMetadata(
-                METADATA_BYTES_LEN, kv_shape, kv_dtype, memory_format
+                self.remote_metadata_bytes, kv_shapes, kv_dtypes, memory_format
             )
             meta_bytes = remote_meta.serialize()
             meta_list.append(meta_bytes)
@@ -555,8 +566,11 @@ class EICConnector(RemoteConnector):
             data_size = len(kv_bytes)
 
             logger.info(
-                f"eic batched_put {key_str} shape {kv_shape} dtype {kv_dtype}"
-                " fmt {memory_format}"
+                "eic batched_put %s, shapes: %s, dtypes: %s, fmt: %s",
+                key_str,
+                kv_shapes,
+                kv_dtypes,
+                memory_format,
             )
 
             # Add meta key & value

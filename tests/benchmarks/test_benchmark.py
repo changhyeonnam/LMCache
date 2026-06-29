@@ -23,6 +23,10 @@ from tests.v1.utils import (
     generate_tokens,
 )
 
+# Optional override for tempfile root; see tests/v1/test_cache_engine.py
+# for rationale.
+_TEST_TMPDIR = os.environ.get("LMCACHE_TEST_TMPDIR") or None
+
 
 # helper functions
 def generate_random_slot_mapping(num_blocks, block_size, num_tokens, device):
@@ -91,9 +95,8 @@ def create_config():
                 print("Supported backends: 'cpu', 'disk', and 'fsconnector'")
                 raise ValueError(f"Unknown backend: {backend}")
 
-    homedir = os.environ.get("HOME", "/tmp")
     with tempfile.TemporaryDirectory(
-        dir=homedir, ignore_cleanup_errors=True
+        dir=_TEST_TMPDIR, ignore_cleanup_errors=True
     ) as temp_dir:
         print("Temp dir is:", temp_dir)
         yield partial(make_config, path=temp_dir)
@@ -144,7 +147,6 @@ def test_store_1GB(
 
     # lmcache and vllm configs
     device = "cuda"
-    fmt = "vllm"
     num_tokens = 2000
 
     num_blocks = 1000
@@ -172,7 +174,7 @@ def test_store_1GB(
         LMCacheEngineBuilder.get_or_create(
             "test",
             cfg,
-            dumb_metadata(fmt, kv_shape),
+            dumb_metadata(kv_shape),
             connector,
             mock_up_broadcast_fn,
             mock_up_broadcast_object_fn,
@@ -259,7 +261,6 @@ def test_retrieve_1GB_allhit(
 
     # lmcache and vllm configs
     device = "cuda"
-    fmt = "vllm"
     num_tokens = 2000
 
     num_blocks = 1000
@@ -294,7 +295,7 @@ def test_retrieve_1GB_allhit(
         LMCacheEngineBuilder.get_or_create(
             "test",
             cfg,
-            dumb_metadata(fmt, kv_shape),
+            dumb_metadata(kv_shape),
             connector,
             mock_up_broadcast_fn,
             mock_up_broadcast_object_fn,
@@ -379,7 +380,6 @@ def test_lookup_20K_tokens(
 
     # lmcache and vllm configs
     device = "cuda"
-    fmt = "vllm"
     num_tokens = 2000
 
     num_blocks = 1000
@@ -413,7 +413,7 @@ def test_lookup_20K_tokens(
         LMCacheEngineBuilder.get_or_create(
             "test",
             cfg,
-            dumb_metadata(fmt, kv_shape),
+            dumb_metadata(kv_shape),
             connector,
             mock_up_broadcast_fn,
             mock_up_broadcast_object_fn,

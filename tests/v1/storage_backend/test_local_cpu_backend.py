@@ -11,12 +11,12 @@ from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.cache_controller.message import BatchedKVOperationMsg, OpType
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import (
-    AdHocMemoryAllocator,
-    MemoryFormat,
-    MemoryObj,
-)
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MixedMemoryAllocator
+from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from tests.v1.utils import create_test_memory_obj
+import lmcache.v1.storage_backend.local_cpu_backend as local_cpu_backend_module
 
 
 class MockLookupServer:
@@ -57,28 +57,57 @@ def create_test_config(
 
 def create_test_key(key_id: str = "test_key") -> CacheEngineKey:
     """Create a test CacheEngineKey."""
-    return CacheEngineKey("vllm", "test_model", 3, 123, hash(key_id), torch.bfloat16)
+    return CacheEngineKey(
+        model_name="test_model",
+        world_size=3,
+        worker_id=0,
+        chunk_hash=hash(key_id),
+        dtype=torch.bfloat16,
+    )
 
 
-def create_test_memory_obj(shape=(2, 16, 8, 128), dtype=torch.bfloat16) -> MemoryObj:
-    """Create a test MemoryObj using AdHocMemoryAllocator for testing."""
-    allocator = AdHocMemoryAllocator(device="cpu")
-    memory_obj = allocator.allocate(shape, dtype, fmt=MemoryFormat.KV_T2D)
-    return memory_obj
+def create_test_metadata() -> LMCacheMetadata:
+    return LMCacheMetadata(
+        model_name="test_model",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(4, 2, 256, 8, 128),
+    )
 
 
 @pytest.fixture
 def local_cpu_backend(memory_allocator):
     """Create a LocalCPUBackend for testing."""
     config = create_test_config()
-    return LocalCPUBackend(config=config, memory_allocator=memory_allocator)
+
+    # Initialize PinMonitor before creating backend
+    PinMonitor.GetOrCreate(config)
+
+    backend = LocalCPUBackend(config=config, memory_allocator=memory_allocator)
+
+    yield backend
+
+    # Cleanup: destroy PinMonitor after test
+    PinMonitor.DestroyInstance()
 
 
 @pytest.fixture
 def local_cpu_backend_disabled(memory_allocator):
     """Create a LocalCPUBackend with local_cpu disabled."""
     config = create_test_config(local_cpu=False)
-    return LocalCPUBackend(config=config, memory_allocator=memory_allocator)
+
+    # Initialize PinMonitor before creating backend
+    PinMonitor.GetOrCreate(config)
+
+    backend = LocalCPUBackend(config=config, memory_allocator=memory_allocator)
+
+    yield backend
+
+    # Cleanup: destroy PinMonitor after test
+    PinMonitor.DestroyInstance()
 
 
 class TestLocalCPUBackend:
@@ -181,8 +210,8 @@ class TestLocalCPUBackend:
     def test_submit_put_task_reinsert(self, local_cpu_backend):
         """Test submit_put_task() with reinsertion."""
         key = create_test_key("test_key")
-        memory_obj1 = create_test_memory_obj(shape=(2, 16, 8, 128))
-        memory_obj2 = create_test_memory_obj(shape=(2, 32, 8, 128))
+        memory_obj1 = create_test_memory_obj(shape=torch.Size([2, 16, 8, 128]))
+        memory_obj2 = create_test_memory_obj(shape=torch.Size([2, 32, 8, 128]))
 
         # First insertion
         local_cpu_backend.submit_put_task(key, memory_obj1)
@@ -512,3 +541,188 @@ class TestLocalCPUBackend:
         local_cpu_backend.remove(key)
         assert memory_obj.get_ref_count() == initial_ref_count + 1
         local_cpu_backend.memory_allocator.close()
+
+
+@pytest.mark.no_shared_allocator
+class TestLocalCPUBackendAllocatorRecovery:
+    def teardown_method(self, method):
+        LMCStatsMonitor.unregister_all_metrics()
+        LMCStatsMonitor.DestroyInstance()
+        PinMonitor.DestroyInstance()
+
+    def test_batched_allocate_fails_while_group_pinned_then_recovers(self):
+        chunk_bytes = 1024 * 1024
+        batch_size = 2
+        shape = torch.Size([1, chunk_bytes])
+        config = create_test_config()
+        PinMonitor.GetOrCreate(config)
+        allocator = MixedMemoryAllocator(chunk_bytes * batch_size)
+        backend = LocalCPUBackend(config=config, memory_allocator=allocator)
+        layer_keys = create_test_key("batched_pinned").split_layers(batch_size)
+
+        memory_objs = backend.batched_allocate(
+            shape,
+            torch.uint8,
+            batch_size=batch_size,
+            fmt=MemoryFormat.KV_T2D,
+            busy_loop=False,
+        )
+        assert memory_objs is not None
+        backend.batched_submit_put_task(layer_keys, memory_objs)
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_down()
+
+        assert backend.pin(layer_keys[0])
+        assert (
+            backend.batched_allocate(
+                shape,
+                torch.uint8,
+                batch_size=batch_size,
+                fmt=MemoryFormat.KV_T2D,
+                busy_loop=False,
+            )
+            is None
+        )
+        assert all(key in backend.hot_cache for key in layer_keys)
+
+        assert backend.unpin(layer_keys[0])
+        recovered = backend.batched_allocate(
+            shape,
+            torch.uint8,
+            batch_size=batch_size,
+            fmt=MemoryFormat.KV_T2D,
+            busy_loop=False,
+        )
+        assert recovered is not None
+        assert all(key not in backend.hot_cache for key in layer_keys)
+        assert allocator.memcheck()
+
+        for memory_obj in recovered:
+            memory_obj.ref_count_down()
+        allocator.close()
+
+    def test_batched_allocate_recovers_with_fully_evictable_group(self):
+        chunk_bytes = 4096
+        batch_size = 2
+        shape = torch.Size([1, chunk_bytes])
+        config = create_test_config()
+        PinMonitor.GetOrCreate(config)
+        allocator = MixedMemoryAllocator(chunk_bytes * batch_size * 2)
+        backend = LocalCPUBackend(config=config, memory_allocator=allocator)
+        pinned_group_keys = create_test_key("batched_pinned_group").split_layers(
+            batch_size
+        )
+        safe_group_keys = create_test_key("batched_safe_group").split_layers(batch_size)
+
+        pinned_group_objs = backend.batched_allocate(
+            shape,
+            torch.uint8,
+            batch_size=batch_size,
+            fmt=MemoryFormat.KV_T2D,
+            busy_loop=False,
+        )
+        safe_group_objs = backend.batched_allocate(
+            shape,
+            torch.uint8,
+            batch_size=batch_size,
+            fmt=MemoryFormat.KV_T2D,
+            busy_loop=False,
+        )
+        assert pinned_group_objs is not None
+        assert safe_group_objs is not None
+        backend.batched_submit_put_task(pinned_group_keys, pinned_group_objs)
+        backend.batched_submit_put_task(safe_group_keys, safe_group_objs)
+        for memory_obj in pinned_group_objs + safe_group_objs:
+            memory_obj.ref_count_down()
+
+        assert backend.pin(pinned_group_keys[0])
+        recovered = backend.batched_allocate(
+            shape,
+            torch.uint8,
+            batch_size=batch_size,
+            fmt=MemoryFormat.KV_T2D,
+            busy_loop=False,
+        )
+
+        assert recovered is not None
+        assert all(key in backend.hot_cache for key in pinned_group_keys)
+        assert all(key not in backend.hot_cache for key in safe_group_keys)
+
+        for memory_obj in recovered:
+            memory_obj.ref_count_down()
+        assert backend.unpin(pinned_group_keys[0])
+        backend.clear()
+        assert allocator.memcheck()
+        allocator.close()
+
+
+class TestLocalCPUBackendAllocatorAlignment:
+    def test_rust_odirect_auto_alignment_for_mixed_allocator(self, monkeypatch):
+        config = create_test_config(local_cpu=True)
+        config.max_local_cpu_size = 0.01
+        config.extra_config = {
+            "rust_raw_block.device_path": "/tmp/dev.bin",
+            "rust_raw_block.use_odirect": True,
+            "rust_raw_block.block_align": 4096,
+        }
+        metadata = create_test_metadata()
+
+        captured: dict[str, object] = {}
+
+        class DummyMixedMemoryAllocator:
+            def __init__(self, size, **kwargs):
+                captured["size"] = size
+                captured["kwargs"] = kwargs
+                self.align_bytes = kwargs.get("align_bytes", 4096)
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(
+            local_cpu_backend_module,
+            "MixedMemoryAllocator",
+            DummyMixedMemoryAllocator,
+        )
+
+        backend = LocalCPUBackend(config=config, metadata=metadata, dst_device="cpu")
+        try:
+            kwargs = captured["kwargs"]
+            assert isinstance(kwargs, dict)
+            assert kwargs.get("align_bytes") == 4096
+        finally:
+            backend.memory_allocator.close()
+
+    def test_explicit_alignment_override_for_mixed_allocator(self, monkeypatch):
+        config = create_test_config(local_cpu=True)
+        config.max_local_cpu_size = 0.01
+        config.extra_config = {
+            "local_cpu.pinned_align_bytes": 4096,
+            "rust_raw_block.device_path": "/tmp/dev.bin",
+            "rust_raw_block.use_odirect": False,
+        }
+        metadata = create_test_metadata()
+
+        captured: dict[str, object] = {}
+
+        class DummyMixedMemoryAllocator:
+            def __init__(self, size, **kwargs):
+                captured["size"] = size
+                captured["kwargs"] = kwargs
+                self.align_bytes = kwargs.get("align_bytes", 4096)
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(
+            local_cpu_backend_module,
+            "MixedMemoryAllocator",
+            DummyMixedMemoryAllocator,
+        )
+
+        backend = LocalCPUBackend(config=config, metadata=metadata, dst_device="cpu")
+        try:
+            kwargs = captured["kwargs"]
+            assert isinstance(kwargs, dict)
+            assert kwargs.get("align_bytes") == 4096
+        finally:
+            backend.memory_allocator.close()

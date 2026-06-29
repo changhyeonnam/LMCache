@@ -67,6 +67,7 @@ class NixlChannel(BaseTransferChannel):
     def __init__(
         self,
         async_mode: bool = False,
+        device: Optional[str] = None,
         **kwargs,
     ):
         assert "role" in kwargs
@@ -89,6 +90,7 @@ class NixlChannel(BaseTransferChannel):
             page_size=kwargs["align_bytes"],
             tp_rank=kwargs["tp_rank"],
             backends=backends,
+            device=device,
         )
         self.nixl_agent = self.nixl_wrapper.agent
 
@@ -462,7 +464,45 @@ class NixlChannel(BaseTransferChannel):
         buffers: Union[list[bytes], list[MemoryObj]],
         transfer_spec: Optional[dict] = None,
     ) -> int:
-        raise NotImplementedError
+        """
+        Read a batch of data from a remote peer through the nixl channel.
+
+        This is the reverse of batched_write: the local side initiates a READ
+        from the remote peer's memory into local buffers.
+
+        :param buffers: A list of MemoryObj to store the read data.
+        :param transfer_spec: Must contain 'sender_id' and 'remote_indexes'.
+
+        :return: Number of successfully transferred objects.
+        """
+        assert transfer_spec is not None
+
+        handle = self.nixl_agent.make_prepped_xfer(
+            "READ",
+            self.nixl_wrapper.xfer_handler,
+            self.get_local_mem_indices(buffers),
+            self.remote_xfer_handlers_dict[transfer_spec["sender_id"]],
+            transfer_spec["remote_indexes"],
+        )
+
+        self.nixl_agent.transfer(handle)
+
+        # Poll for completion
+        wait_time = 0.001
+        while True:
+            status = self.nixl_agent.check_xfer_state(handle)
+            logger.debug(f"Read transfer status: {status}")
+
+            if status == "ERR":
+                logger.error("Error in read operation")
+                raise RuntimeError("Failed to read objects from remote peer")
+            elif status == "PROC":
+                time.sleep(wait_time)
+                continue
+            assert status == "DONE", f"Transfer status is {status}, expected DONE"
+            break
+
+        return len(buffers)
 
     async def async_batched_write(
         self,
@@ -579,6 +619,7 @@ class NixlAgentWrapper:
         page_size: int,
         tp_rank: int,
         backends: list[str],
+        device: Optional[str] = None,
     ):
         """
         Initialize the NIXL agent.
@@ -618,8 +659,20 @@ class NixlAgentWrapper:
         # The four fields are (base_addr, length, dev_id, meta_info)
         # https://github.com/ai-dynamo/nixl/blob/main/src/api/cpp/nixl_descriptors.h#L152
         memory_desc = [(buffer_ptr, buffer_size, tp_rank, "")]
-        # TODO(Jiayi): remove hardcode `mem_type`
-        reg_descs = nixl_agent.get_reg_descs(memory_desc, mem_type="cuda")
+        _VRAM_DEVICE_TYPES = {"cuda", "xpu", "hpu"}
+
+        device_type = str(device).split(":")[0]
+        if device_type == "cpu":
+            mem_type = "cpu"
+        elif device_type in _VRAM_DEVICE_TYPES:
+            mem_type = "VRAM"
+        else:
+            raise ValueError(
+                f"Unsupported device type '{device_type}' for NIXL. "
+                f"Supported accelerators: {_VRAM_DEVICE_TYPES}"
+            )
+
+        reg_descs = nixl_agent.get_reg_descs(memory_desc, mem_type=mem_type)
         nixl_agent.register_memory(reg_descs)
 
         # Create xfer handlers
@@ -627,9 +680,8 @@ class NixlAgentWrapper:
         for base_addr in range(buffer_ptr, buffer_ptr + buffer_size, page_size):
             xfer_desc.append((base_addr, page_size, tp_rank))
 
-        xfer_descs = nixl_agent.get_xfer_descs(xfer_desc, mem_type="cuda")
-        xfer_handler = nixl_agent.prep_xfer_dlist("", xfer_descs, mem_type="cuda")
-
+        xfer_descs = nixl_agent.get_xfer_descs(xfer_desc, mem_type=mem_type)
+        xfer_handler = nixl_agent.prep_xfer_dlist("", xfer_descs, mem_type=mem_type)
         self.agent = nixl_agent
         self.reg_descs = reg_descs
         self.xfer_descs = xfer_descs
