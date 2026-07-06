@@ -271,7 +271,8 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         pinned-pool CUDA context lands on the worker GPU.
         """
         if not self._pinning_started:
-            self.ensure_pinning(torch_dev.current_device())
+            device = torch_dev.current_device() if torch_dev.is_available() else 0
+            self.ensure_pinning(device)
 
     def _pin_memory_chunk(self, offset: int, size: int):
         """
