@@ -246,6 +246,7 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
             # Free the underlying buffer if using NUMA allocation
             if self._use_numa:
                 lmc_ops.free_numa_ptr(self._buffer.data_ptr(), self._final_size)
+                self._use_numa = False
 
     def memcheck(self) -> bool:
         return self._allocator.memcheck()
