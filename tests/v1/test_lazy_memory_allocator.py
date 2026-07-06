@@ -42,7 +42,7 @@ def mock_tma():
         yield tma
 
 
-def _make_allocator(init=PIN_CHUNK, final=PIN_CHUNK):
+def _make_allocator(init: int = PIN_CHUNK, final: int = PIN_CHUNK) -> LazyMemoryAllocator:
     """Build an allocator. init == final keeps the expand thread a no-op."""
     return LazyMemoryAllocator(init, final)
 
