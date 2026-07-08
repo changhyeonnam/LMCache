@@ -2,7 +2,10 @@
 """Structural interface shared by the L1 memory manager tiers."""
 
 # Standard
-from typing import Optional, Protocol, runtime_checkable
+from typing import Optional, Protocol, Union, runtime_checkable
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.v1.distributed.api import MemoryLayoutDesc
@@ -28,6 +31,14 @@ class L1ManagerProtocol(Protocol):
 
     def free(self, mem_objs: list[MemoryObj]) -> L1Error:
         """Free the given memory objects."""
+        ...
+
+    def ensure_pinning(self, device: Union[int, torch.device]) -> None:
+        """Warm up device-bound resources (e.g. a deferred pinned pool).
+
+        Non-blocking, idempotent, and thread-safe. No-op for tiers without
+        a host-pinned pool (e.g. GDS).
+        """
         ...
 
     def get_memory_usage(self) -> tuple[int, int]:

@@ -1257,6 +1257,20 @@ class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
         """
         return
 
+    def ensure_pinning(self, device: Union[int, torch.device]) -> None:
+        """
+        Warm up device-bound resources for this allocator, if any.
+
+        Default is a no-op. Allocators that defer host pinning (e.g.
+        ``LazyMemoryAllocator``) override this to bind the pinned pool's
+        CUDA context to ``device`` and start pinning in the background.
+        Implementations must be non-blocking, idempotent, and thread-safe.
+
+        Args:
+            device: Device whose context the pinned pool is bound to.
+        """
+        return
+
     def memcheck(self) -> bool:
         """
         Checks the memory allocator for consistency.

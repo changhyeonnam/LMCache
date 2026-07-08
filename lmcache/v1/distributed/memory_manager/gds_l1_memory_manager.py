@@ -2,7 +2,10 @@
 """GDS slab-file L1 memory manager."""
 
 # Standard
-from typing import Optional
+from typing import Optional, Union
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.integration.vllm.utils import get_size_bytes
@@ -119,6 +122,10 @@ class GDSL1MemoryManager:
         must be disabled when GDS L1 is enabled).
         """
         return None
+
+    def ensure_pinning(self, device: Union[int, torch.device]) -> None:
+        """No-op: the GDS slab file has no host-pinned pool to warm up."""
+        return
 
     def close(self) -> None:
         """No-op: the GDSContext owning the slab is closed at server shutdown."""

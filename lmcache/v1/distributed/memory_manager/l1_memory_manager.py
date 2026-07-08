@@ -3,6 +3,10 @@
 
 # Standard
 from multiprocessing import shared_memory
+from typing import Union
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.logging import init_logger
@@ -102,6 +106,20 @@ class L1MemoryManager:
         self._allocator = create_memory_allocator(config)
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
+
+    def ensure_pinning(self, device: Union[int, torch.device]) -> None:
+        """
+        Warm up the underlying allocator's device-bound resources, if any.
+
+        Non-blocking; delegates to the allocator (no-op for allocators
+        without deferred pinning). Called from the worker-registration
+        path so the pinned pool's CUDA context lands on the worker's
+        device before any request arrives.
+
+        Args:
+            device: Device whose context the pinned pool is bound to.
+        """
+        self._allocator.ensure_pinning(device)
 
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int

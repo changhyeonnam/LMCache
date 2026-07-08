@@ -5,9 +5,12 @@ Distributed multi-tier storage manager for MP mode
 
 # Standard
 from contextlib import contextmanager
-from typing import Iterator, Literal, Optional
+from typing import Iterator, Literal, Optional, Union
 import threading
 import time
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.logging import init_logger
@@ -167,6 +170,19 @@ class StorageManager:
         )
 
     # External APIs for serving engine integration code to call
+    def ensure_pinning(self, device: Union[int, torch.device]) -> None:
+        """
+        Warm up the L1 pool's device-bound resources, if any.
+
+        Non-blocking; delegates down to the L1 tier. Called from the
+        worker-registration path so the pinned pool's CUDA context lands
+        on the worker's device before any request arrives.
+
+        Args:
+            device: Device whose context the pinned pool is bound to.
+        """
+        self._l1_manager.ensure_pinning(device)
+
     @enable_tracing()
     def reserve_write(
         self,

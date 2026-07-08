@@ -5,8 +5,11 @@ Managing objects and memory for L1 cache
 
 # Standard
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Union
 import threading
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.logging import init_logger
@@ -238,6 +241,19 @@ class L1Manager:
         """
         with self._lock:
             self._registered_listeners.append(listener)
+
+    def ensure_pinning(self, device: Union[int, torch.device]) -> None:
+        """
+        Warm up the L1 tier's device-bound resources, if any.
+
+        Non-blocking; delegates to the memory manager (no-op for tiers
+        without a host-pinned pool). Called from the worker-registration
+        path with the worker's device.
+
+        Args:
+            device: Device whose context the pinned pool is bound to.
+        """
+        self._memory_manager.ensure_pinning(device)
 
     @l1_mgr_synchronized
     def reserve_read(

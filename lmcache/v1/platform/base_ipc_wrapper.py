@@ -103,6 +103,22 @@ class DeviceIPCWrapper:
             )
         return device_index
 
+    def device_index(self) -> int:
+        """Physical device ordinal (in this process) of the wrapped tensor.
+
+        Resolves the wrapper's ``device_uuid`` against the devices visible
+        to the calling process, so the returned index is valid in the
+        receiver's device numbering even when sender and receiver see
+        different ``CUDA_VISIBLE_DEVICES`` orderings.
+
+        Returns:
+            The device ordinal usable with ``torch_dev.device(...)``.
+
+        Raises:
+            RuntimeError: If the device is not visible to this process.
+        """
+        return self._get_device_index_from_uuid(self.device_uuid)
+
     def to_tensor(self) -> torch.Tensor:
         """Reconstruct the tensor in this process from the IPC handle.
 

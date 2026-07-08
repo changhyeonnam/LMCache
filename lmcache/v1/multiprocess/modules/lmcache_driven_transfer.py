@@ -886,6 +886,25 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             cache_context.num_layers,
         )
 
+        # Warm up the L1 pinned pool on this worker's device (non-blocking
+        # and idempotent), so the pin cost overlaps with the engine's own
+        # startup instead of the first request, and the pinned pool's CUDA
+        # context lands on a worker GPU instead of cuda:0. Registration
+        # completing does NOT mean the pool is ready; until pinning
+        # finishes, allocations just return None (a cache miss).
+        if kv_caches:
+            try:
+                device = kv_caches[0].device_index()
+            except RuntimeError:
+                logger.warning(
+                    "Could not resolve the registering worker's device; "
+                    "skipping the L1 pin warm-up (the allocate-time "
+                    "fallback will pin later)",
+                    exc_info=True,
+                )
+            else:
+                self._ctx.storage_manager.ensure_pinning(device)
+
     def unregister_kv_cache(self, instance_id: int) -> None:
         """Unregister the KV cache tensors for a given GPU instance ID.
 
